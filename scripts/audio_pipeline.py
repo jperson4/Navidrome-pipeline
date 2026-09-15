@@ -47,17 +47,19 @@ import os
 import re
 import shutil
 import subprocess
+import threading
+import unicodedata
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from dataclasses import dataclass
 from pathlib import Path
-from typing import List, Optional, Sequence, Tuple
+from typing import Dict, List, Optional, Sequence, Tuple
 
 from dotenv import load_dotenv
 
 load_dotenv()
 
 try:
-    from mutagen.id3 import ID3, ID3NoHeaderError
+    from mutagen.id3 import ID3, ID3NoHeaderError, TIT2
     MUTAGEN_AVAILABLE = True
 except ImportError:  # noqa: BLE001
     MUTAGEN_AVAILABLE = False
@@ -183,6 +185,102 @@ def sanitize(s: str) -> str:
 
 
 # ─────────────────────────────────────────────────────────────────────────────
+#  ARTIST NAME MATCHING (case/accent-insensitive)
+# ─────────────────────────────────────────────────────────────────────────────
+
+def normalize_name(s: str) -> str:
+    """Normalizes a name for comparison purposes only: lowercase and with
+    diacritics stripped (á -> a, ë -> e, Ñ -> n, etc.). Used just to decide
+    whether two artist names are "the same", never to rename anything."""
+    s = unicodedata.normalize("NFKD", s)
+    s = "".join(ch for ch in s if not unicodedata.combining(ch))
+    return s.casefold()
+
+
+def resolve_folder_name(
+    raw_name: str,
+    cache: Dict[Tuple[str, str], str],
+    lock: threading.Lock,
+    fallback: str,
+    scope: str = "",
+) -> str:
+    """
+    Returns the folder name to actually use on disk (shared by artist and
+    album resolution).
+
+    Comparison is case/accent-insensitive (via normalize_name), but the
+    folder name that gets used/stored is always the ORIGINAL (non-normalized)
+    one. `cache` maps (scope, normalized_name) -> canonical_folder_name and
+    is shared across threads (protected by `lock`):
+
+      - Pre-populated in main() from the folders that already exist in
+        `dest` (artists directly, albums inside each artist), so an
+        incoming "ANNE" matches a pre-existing "annë" and reuses that same
+        folder instead of creating a duplicate.
+      - The first time a brand-new name is seen (in this run), its
+        sanitized form is registered as the canonical one; any later
+        variant (different case/accents) resolves to that same folder,
+        i.e. "the one that was already there before" wins.
+
+    `scope` lets the same name be reused independently per context — e.g.
+    two different artists can each have an album called "Singles" without
+    colliding, since albums are scoped by their (already-resolved) artist
+    folder name.
+    """
+    sanitized = sanitize(raw_name) if raw_name else fallback
+    key = (scope, normalize_name(sanitized))
+    with lock:
+        existing = cache.get(key)
+        if existing is not None:
+            return existing
+        cache[key] = sanitized
+        return sanitized
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+#  TITLE CLEANUP (strip redundant tags like "(Original Mix)")
+# ─────────────────────────────────────────────────────────────────────────────
+
+# Add more phrases here to also strip them (e.g. "radio edit", "club mix").
+# Only trailing tags are removed, so real content earlier in the title is
+# never touched.
+REDUNDANT_TITLE_TAGS = (
+    "original mix",
+    "original version",
+    "original edit",
+    "original",
+)
+
+_tag_alt = "|".join(
+    re.escape(t) for t in sorted(REDUNDANT_TITLE_TAGS, key=len, reverse=True)
+)
+_TITLE_TAG_RE = re.compile(
+    rf"""
+    \s*(?:
+        [\(\[]\s*(?:{_tag_alt})\s*[\)\]]   # "(Original Mix)" / "[Original Mix]"
+        |
+        -\s*(?:{_tag_alt})                  # " - Original Mix"
+    )\s*$
+    """,
+    re.IGNORECASE | re.VERBOSE,
+)
+
+
+def clean_title(title: str) -> str:
+    """Strips redundant trailing tags (see REDUNDANT_TITLE_TAGS) from a
+    track title, case-insensitively. Runs repeatedly in case a title has
+    more than one such tag stacked at the end (e.g. "Song (Original Mix) -
+    Original Version")."""
+    cleaned = title
+    while True:
+        new = _TITLE_TAG_RE.sub("", cleaned).strip()
+        if new == cleaned:
+            return new or title  # never return an empty title
+        cleaned = new
+
+
+
+# ─────────────────────────────────────────────────────────────────────────────
 #  UNIQUE PATH INSIDE DUPLICATES (avoids overwriting another same-named duplicate)
 # ─────────────────────────────────────────────────────────────────────────────
 
@@ -259,6 +357,22 @@ def strip_genre(file: Path) -> None:
         pass
 
 
+def write_title_tag(file: Path, new_title: str) -> None:
+    """Overwrites the TIT2 (title) ID3 frame with `new_title` (in-place,
+    no re-encoding). Does nothing if mutagen isn't installed or the file
+    has no ID3 tags — in that case only the filename ends up cleaned."""
+    if not MUTAGEN_AVAILABLE:
+        return
+    try:
+        tags = ID3(str(file))
+        tags.setall("TIT2", [TIT2(encoding=3, text=new_title)])
+        tags.save(str(file))
+    except ID3NoHeaderError:
+        pass
+    except Exception:  # noqa: BLE001
+        pass
+
+
 # ─────────────────────────────────────────────────────────────────────────────
 #  WORKER - PHASE 2: Organize (Artist/Album) + Rename
 # ─────────────────────────────────────────────────────────────────────────────
@@ -276,8 +390,18 @@ def get_bitrate(path: Path) -> int:
         return 0
 
 
-def worker_organize(file: Path, shared_data: Tuple[str, str, List[str]]) -> Result:
-    source, dest, excluded = shared_data
+@dataclass
+class OrganizeContext:
+    source: str
+    dest: str
+    excluded: List[str]
+    artist_cache: Dict[Tuple[str, str], str]
+    album_cache: Dict[Tuple[str, str], str]
+    naming_lock: threading.Lock
+
+
+def worker_organize(file: Path, ctx: OrganizeContext) -> Result:
+    source, dest, excluded = ctx.source, ctx.dest, ctx.excluded
 
     # ── If the file is in an excluded folder (includes Duplicates) -> SKIP
     for ex in excluded:
@@ -307,14 +431,21 @@ def worker_organize(file: Path, shared_data: Tuple[str, str, List[str]]) -> Resu
     # compilations and remix albums correctly (each track with a
     # different artist).
     if tags.get("album_artist"):
-        artist_folder = sanitize(tags["album_artist"].strip())
+        raw_artist_name = tags["album_artist"].strip()
     elif tags.get("artist"):
-        artist_folder = sanitize(tags["artist"].strip())
+        raw_artist_name = tags["artist"].strip()
     else:
-        artist_folder = "Unknown Artist"
+        raw_artist_name = "Unknown Artist"
 
-    album_raw = tags["album"].strip() if tags.get("album") else "Unknown Album"
-    album_folder = sanitize(album_raw)
+    artist_folder = resolve_folder_name(
+        raw_artist_name, ctx.artist_cache, ctx.naming_lock, fallback="Unknown Artist",
+    )
+
+    raw_album_name = tags["album"].strip() if tags.get("album") else "Unknown Album"
+    album_folder = resolve_folder_name(
+        raw_album_name, ctx.album_cache, ctx.naming_lock,
+        fallback="Unknown Album", scope=artist_folder,
+    )
 
     # ── File name ─────────────────────────────────────────────────────────────
     track = ""
@@ -323,7 +454,13 @@ def worker_organize(file: Path, shared_data: Tuple[str, str, List[str]]) -> Resu
         track = f"{int(t):02d}" if t.isdigit() else t
 
     artist_raw = tags["artist"].strip() if tags.get("artist") else ""
-    title = tags["title"].strip() if tags.get("title") else file.stem
+    raw_title = tags["title"].strip() if tags.get("title") else file.stem
+    title = clean_title(raw_title)
+
+    # If the file actually had a title tag and cleaning changed it, write
+    # the cleaned version back to the ID3 tag too (not just the filename).
+    if tags.get("title") and title != raw_title:
+        write_title_tag(file, title)
 
     if track and artist_raw and title:
         new_name = f"{track} - {artist_raw} - {title}"
@@ -527,7 +664,8 @@ def main() -> None:
         print(f"  {C.DYELLOW}Exclude    : {', '.join(exclude_abs)}{C.RESET}")
     if not MUTAGEN_AVAILABLE:
         print(f"  {C.YELLOW}[WARNING] mutagen not installed (pip install mutagen): "
-              f"genre won't be stripped from MP3s that already came in that format.{C.RESET}")
+              f"genre won't be stripped and title tags won't be cleaned of "
+              f"redundant tags (only the filename will be).{C.RESET}")
 
     # ── PHASE 0 (optional): DELETE NON-AUDIO FILES ───────────────────────────
     non_audio_deleted = 0
@@ -591,11 +729,33 @@ def main() -> None:
         and not any(str(p).startswith(ex.rstrip("/") + "/") for ex in exclude_abs)
     ]
 
+    # ── Artist/album name cache (case/accent-insensitive matching) ──────────
+    # Pre-populated by scanning the artist/album folders that already exist
+    # in `dest`, so an incoming name processed with different case/accents
+    # (e.g. "ANNE" vs an existing "annë") reuses the folder that was
+    # already there instead of creating a new, duplicate one.
+    artist_cache: Dict[Tuple[str, str], str] = {}
+    album_cache: Dict[Tuple[str, str], str] = {}
+    naming_lock = threading.Lock()
+    if dest_abs.exists():
+        for artist_dir in sorted(dest_abs.iterdir()):
+            if not artist_dir.is_dir():
+                continue
+            artist_cache.setdefault(("", normalize_name(artist_dir.name)), artist_dir.name)
+            for album_dir in sorted(artist_dir.iterdir()):
+                if album_dir.is_dir():
+                    album_cache.setdefault(
+                        (artist_dir.name, normalize_name(album_dir.name)), album_dir.name,
+                    )
+
     org_ok = org_ex = org_err = org_skip = org_dup = 0
     if mp3s:
         print(f"  MP3 files to process : {len(mp3s)}\n")
-        shared_data = (str(source_abs), str(dest_abs), exclude_abs)
-        org_res = invoke_pool(worker_organize, mp3s, args.threads, "Phase 2", shared_data)
+        ctx = OrganizeContext(
+            source=str(source_abs), dest=str(dest_abs), excluded=exclude_abs,
+            artist_cache=artist_cache, album_cache=album_cache, naming_lock=naming_lock,
+        )
+        org_res = invoke_pool(worker_organize, mp3s, args.threads, "Phase 2", ctx)
         org_ok = sum(1 for r in org_res if r.status == "OK")
         org_ex = sum(1 for r in org_res if r.status == "EXISTS")
         org_err = sum(1 for r in org_res if r.status == "ERROR")
