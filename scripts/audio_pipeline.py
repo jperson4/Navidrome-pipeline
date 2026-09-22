@@ -101,7 +101,8 @@ DUPLICATES_DIRNAME = "Duplicados"
 
 EXCLUDED: List[str] = []  # filled in main() with --exclude and Duplicates
 EXCLUDED.append(f"./{DUPLICATES_DIRNAME}")  # Duplicates is always excluded
-EXCLUDED.append(os.getenv("EXCLUDED_PATH"))
+if os.getenv("EXCLUDED_PATH"):
+    EXCLUDED.append(os.getenv("EXCLUDED_PATH"))
 CONVERTIBLE_EXTENSIONS = {".flac", ".wav", ".ape", ".aiff", ".aif", ".wv",
                           ".ogg", ".m4a", ".aac", ".wma", ".opus"}
 
