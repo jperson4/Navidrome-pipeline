@@ -16,6 +16,10 @@ Phase 2  Reads metadata with ffprobe ONCE per file, organizes into
          moved to the "Duplicates" folder inside the destination,
          instead of being deleted. That folder is automatically
          excluded from future scans.
+         Duplicate detection ignores upper/lower case, accents and
+         special characters (spaces, punctuation, etc.), so
+         "Not a Headliner - Song.mp3" and "Not A Headliner - Sóng.mp3"
+         are considered the same track.
          (ffprobe, ThreadPoolExecutor)
 
 Phase 3  Removes empty folders from source and destination, and also
@@ -186,16 +190,28 @@ def sanitize(s: str) -> str:
 
 
 # ─────────────────────────────────────────────────────────────────────────────
-#  ARTIST NAME MATCHING (case/accent-insensitive)
+#  NAME MATCHING (case / accent / special-character insensitive)
 # ─────────────────────────────────────────────────────────────────────────────
 
-def normalize_name(s: str) -> str:
-    """Normalizes a name for comparison purposes only: lowercase and with
-    diacritics stripped (á -> a, ë -> e, Ñ -> n, etc.). Used just to decide
-    whether two artist names are "the same", never to rename anything."""
+def comparison_key(s: str) -> str:
+    """Key used ONLY to compare names, never to rename anything.
+
+    Ignores upper/lower case, accents/diacritics (á -> a, ë -> e, Ñ -> n),
+    and every non-alphanumeric character (spaces, hyphens, dots,
+    underscores, parentheses, quotes, etc.). So all of these produce the
+    same key:
+        "Not a Headliner"  /  "Not A Headliner"  /  "not-a-headliner"
+    """
     s = unicodedata.normalize("NFKD", s)
     s = "".join(ch for ch in s if not unicodedata.combining(ch))
-    return s.casefold()
+    s = s.casefold()
+    key = re.sub(r"[\W_]+", "", s)   # drop everything that isn't a letter/digit
+    return key or s.strip()          # name made only of symbols (e.g. "!!!")
+
+
+def normalize_name(s: str) -> str:
+    """Kept for backwards compatibility: same as comparison_key()."""
+    return comparison_key(s)
 
 
 def resolve_folder_name(
@@ -209,10 +225,11 @@ def resolve_folder_name(
     Returns the folder name to actually use on disk (shared by artist and
     album resolution).
 
-    Comparison is case/accent-insensitive (via normalize_name), but the
-    folder name that gets used/stored is always the ORIGINAL (non-normalized)
-    one. `cache` maps (scope, normalized_name) -> canonical_folder_name and
-    is shared across threads (protected by `lock`):
+    Comparison is case/accent/special-character-insensitive (via
+    comparison_key), but the folder name that gets used/stored is always
+    the ORIGINAL (non-normalized) one. `cache` maps
+    (scope, normalized_name) -> canonical_folder_name and is shared across
+    threads (protected by `lock`):
 
       - Pre-populated in main() from the folders that already exist in
         `dest` (artists directly, albums inside each artist), so an
@@ -280,7 +297,6 @@ def clean_title(title: str) -> str:
         cleaned = new
 
 
-
 # ─────────────────────────────────────────────────────────────────────────────
 #  UNIQUE PATH INSIDE DUPLICATES (avoids overwriting another same-named duplicate)
 # ─────────────────────────────────────────────────────────────────────────────
@@ -298,6 +314,25 @@ def unique_path(folder: Path, filename: str) -> Path:
         if not candidate.exists():
             return candidate
         counter += 1
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+#  FIND AN ALREADY-EXISTING TRACK (case/accent/special-char insensitive)
+# ─────────────────────────────────────────────────────────────────────────────
+
+def find_existing_track(folder: Path, new_name: str) -> Optional[Path]:
+    """Returns the MP3 inside `folder` that is equivalent to `new_name`
+    (ignoring case, accents, special characters and a trailing
+    "(Original Mix)"-style tag), or None if there isn't one."""
+    if not folder.exists():
+        return None
+
+    target = comparison_key(clean_title(new_name))
+    for p in folder.iterdir():
+        if p.is_file() and p.suffix.lower() == ".mp3":
+            if comparison_key(clean_title(p.stem)) == target:
+                return p
+    return None
 
 
 # ─────────────────────────────────────────────────────────────────────────────
@@ -480,10 +515,14 @@ def worker_organize(file: Path, ctx: OrganizeContext) -> Result:
 
     dest_path = folder / f"{new_name}.mp3"
 
-    if dest_path.exists():
+    # Looks for an equivalent track already in the folder, ignoring case,
+    # accents and special characters (not just an exact filename match).
+    existing_path = find_existing_track(folder, new_name)
+
+    if existing_path is not None:
         # ── Resolve duplicate: bitrate -> size -> the incoming one goes to Duplicates
         bitrate_incoming = get_bitrate(file)
-        bitrate_existing = get_bitrate(dest_path)
+        bitrate_existing = get_bitrate(existing_path)
 
         replace = False
         reason = ""
@@ -493,7 +532,7 @@ def worker_organize(file: Path, ctx: OrganizeContext) -> Result:
             reason = f"bitrate {bitrate_incoming} > {bitrate_existing}"
         elif bitrate_incoming == bitrate_existing:
             size_incoming = file.stat().st_size
-            size_existing = dest_path.stat().st_size
+            size_existing = existing_path.stat().st_size
             if size_incoming > size_existing:
                 replace = True
                 reason = f"same bitrate, size {size_incoming} > {size_existing}"
@@ -504,8 +543,8 @@ def worker_organize(file: Path, ctx: OrganizeContext) -> Result:
         if replace:
             # The one already in dest is the worse one -> sent to Duplicates
             try:
-                dup_dest = unique_path(duplicates_folder, dest_path.name)
-                shutil.move(str(dest_path), str(dup_dest))
+                dup_dest = unique_path(duplicates_folder, existing_path.name)
+                shutil.move(str(existing_path), str(dup_dest))
                 shutil.move(str(file), str(dest_path))
                 return Result(
                     "OK", file.name,
@@ -522,7 +561,7 @@ def worker_organize(file: Path, ctx: OrganizeContext) -> Result:
             return Result(
                 "DUPLICATE", file.name,
                 f"{file.name}  ->  {DUPLICATES_DIRNAME}/{dup_dest.name} "
-                f"(already existed: {artist_folder}/{album_folder}/{new_name}.mp3)",
+                f"(already existed: {artist_folder}/{album_folder}/{existing_path.name})",
             )
         except Exception as e:  # noqa: BLE001
             return Result("ERROR", file.name, str(e))
@@ -730,11 +769,12 @@ def main() -> None:
         and not any(str(p).startswith(ex.rstrip("/") + "/") for ex in exclude_abs)
     ]
 
-    # ── Artist/album name cache (case/accent-insensitive matching) ──────────
+    # ── Artist/album name cache (case/accent/special-char-insensitive) ──────
     # Pre-populated by scanning the artist/album folders that already exist
     # in `dest`, so an incoming name processed with different case/accents
-    # (e.g. "ANNE" vs an existing "annë") reuses the folder that was
-    # already there instead of creating a new, duplicate one.
+    # (e.g. "ANNE" vs an existing "annë", or "Not A Headliner" vs an
+    # existing "Not a Headliner") reuses the folder that was already there
+    # instead of creating a new, duplicate one.
     artist_cache: Dict[Tuple[str, str], str] = {}
     album_cache: Dict[Tuple[str, str], str] = {}
     naming_lock = threading.Lock()
