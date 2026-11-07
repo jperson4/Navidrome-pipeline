@@ -10,35 +10,39 @@ from watchdog.events import FileSystemEventHandler
 
 app = Flask(__name__)
 
-# Ruta de monitoreo automático
+# Ruta explícita del ejecutable de Python dentro del entorno virtual (venv)
+VENV_PYTHON = "/home/escriva/venv/bin/python3"
+
+# Ruta de monitoreo automático para descargas entrantes
 DOWNLOADS_PATH = "/home/escriva/music/baldman/ingresos"
 
 # Configuración de los scripts del pipeline de Navidrome
+# NOTA: Se añade "-u" a los comandos de Python para desactivar el buffering de stdout/stderr
 SCRIPTS = {
     "pipeline": {
         "title": "🎵 Ejecutar Audio Pipeline",
         "desc": "Procesa metadatos en Staging y mueve la música limpia a la biblioteca organizada",
-        "cmd": [sys.executable, "scripts/audio_pipeline.py"]
+        "cmd": [VENV_PYTHON, "-u", "scripts/audio_pipeline.py"]
     },
     "bpm": {
         "title": "🥁 Analizar BPM",
         "desc": "Calcula e incrusta el tempo (BPM) en los metadatos ID3 usando Essentia/Librosa",
-        "cmd": [sys.executable, "scripts/bpm.py"]
+        "cmd": [VENV_PYTHON, "-u", "scripts/bpm.py"]
     },
     "autostar": {
         "title": "⭐ AutoStar Navidrome",
         "desc": "Califica o marca con estrellas automáticamente las canciones/álbumes según reproducción",
-        "cmd": [sys.executable, "scripts/autostar.py"]
+        "cmd": [VENV_PYTHON, "-u", "scripts/autostar.py"]
     },
     "covers": {
         "title": "🖼️ Descargar Carátulas (MBZ → IT → DG)",
         "desc": "Búsqueda en cascada de portadas de los álbumes de Navidrome e incrustado en ID3 / cover.jpg",
-        "cmd": [sys.executable, "scripts/download_covers.py"]
+        "cmd": [VENV_PYTHON, "-u", "scripts/download_covers.py"]
     },
     "wantlist": {
         "title": "📋 Wantlist Discogs desde Navidrome",
         "desc": "Sincroniza álbumes de tus playlists de Navidrome directamente con tu Wantlist de Discogs",
-        "cmd": [sys.executable, "scripts/wantlist_from_navidrome.py"]
+        "cmd": [VENV_PYTHON, "-u", "scripts/wantlist_from_navidrome.py"]
     },
     "clean": {
         "title": "🧹 Limpiar Carpetas Vacías / Solo cover.jpg",
@@ -71,37 +75,39 @@ def run_pipeline_automatically(filepath):
     print("⏳ Esperando 5 segundos a que finalice la copia/descarga del archivo...")
     time.sleep(5)
 
-    print("🚀 Ejecutando Audio Pipeline automáticamente...")
+    print(f"🚀 Ejecutando Audio Pipeline automáticamente con {VENV_PYTHON}...")
     try:
         cmd = SCRIPTS["pipeline"]["cmd"]
+        env = os.environ.copy()
+        env["PYTHONUNBUFFERED"] = "1"  # Desactiva buffering en variables de entorno
+
         process = subprocess.Popen(
             cmd,
             stdout=subprocess.PIPE,
             stderr=subprocess.STDOUT,
             text=True,
-            bufsize=1
+            bufsize=1,
+            env=env
         )
         for line in iter(process.stdout.readline, ''):
             if line:
-                print(f"[AUTO-PIPELINE] {line.strip()}")
+                print(f"[AUTO-PIPELINE] {line.strip()}", flush=True)
         process.stdout.close()
         process.wait()
-        print("✅ [AUTO-TRIGGER] Pipeline finalizado con éxito.\n")
+        print("✅ [AUTO-TRIGGER] Pipeline finalizado con éxito.\n", flush=True)
     except Exception as e:
-        print(f"❌ [AUTO-TRIGGER] Error ejecutando el pipeline automático: {e}\n")
+        print(f"❌ [AUTO-TRIGGER] Error ejecutando el pipeline automático: {e}\n", flush=True)
     finally:
         is_pipeline_running = False
 
 class AutoPipelineHandler(FileSystemEventHandler):
     def on_created(self, event):
-        # Ignorar archivos temporales o directorios si es necesario
         if event.is_directory:
             return
         filename = Path(event.src_path).name
         if filename.startswith(".") or filename.endswith(".tmp") or filename.endswith(".part"):
             return
 
-        # Lanzar la ejecución en un hilo para no bloquear el detector de watchdog
         threading.Thread(target=run_pipeline_automatically, args=(event.src_path,), daemon=True).start()
 
 def start_folder_watcher():
@@ -113,12 +119,11 @@ def start_folder_watcher():
     observer = Observer()
     observer.schedule(event_handler, path=path_to_watch, recursive=True)
     observer.start()
-    print(f"👁️ Monitor activo escuchando cambios en: {path_to_watch}")
+    print(f"👁️ Monitor activo escuchando cambios en: {path_to_watch}", flush=True)
 
-# Arrancar el monitor en segundo plano
 start_folder_watcher()
 
-# --- DISEÑO HTML CON INDICADOR DE ESTADO DEL MONITOR ---
+# --- DISEÑO HTML CON SALIDA DE CONSOLA EN TIEMPO REAL ---
 HTML_LAYOUT = """
 <!DOCTYPE html>
 <html lang="es">
@@ -142,7 +147,7 @@ HTML_LAYOUT = """
         .console-container { background: #0d0d0d; border: 1px solid #333; border-radius: 8px; padding: 15px; }
         .console-header { display: flex; justify-content: space-between; align-items: center; margin-bottom: 10px; border-bottom: 1px solid #222; padding-bottom: 8px; }
         .console-status { font-size: 0.85rem; color: #888; }
-        pre#console { background: transparent; color: #00ff66; padding: 0; margin: 0; font-family: monospace; font-size: 0.85rem; height: 380px; overflow-y: auto; white-space: pre-wrap; word-break: break-all; }
+        pre#console { background: transparent; color: #00ff66; padding: 0; margin: 0; font-family: monospace; font-size: 0.85rem; height: 400px; overflow-y: auto; white-space: pre-wrap; word-break: break-all; }
     </style>
 </head>
 <body>
@@ -165,7 +170,7 @@ HTML_LAYOUT = """
 
         <div class="console-container">
             <div class="console-header">
-                <strong>Salida de Consola Manual</strong>
+                <strong>Salida de Consola en Tiempo Real</strong>
                 <span id="status" class="console-status">Estado: Inactivo</span>
             </div>
             <pre id="console">> Presiona un botón para ejecutar una tarea manualmente...</pre>
@@ -173,24 +178,31 @@ HTML_LAYOUT = """
     </div>
 
     <script>
+        let currentEventSource = null;
+
         function runScript(key) {
             const consoleEl = document.getElementById("console");
             const statusEl = document.getElementById("status");
             const buttons = document.querySelectorAll(".btn");
 
+            if (currentEventSource) {
+                currentEventSource.close();
+            }
+
             buttons.forEach(b => b.disabled = true);
             consoleEl.textContent = `> Iniciando ejecución de ${key}...\n----------------------------------------\n`;
             statusEl.textContent = "Estado: Ejecutando...";
 
-            const eventSource = new EventSource(`/run/${key}`);
+            currentEventSource = new EventSource(`/run/${key}`);
 
-            eventSource.onmessage = function(event) {
+            currentEventSource.onmessage = function(event) {
                 consoleEl.textContent += event.data + "\n";
                 consoleEl.scrollTop = consoleEl.scrollHeight;
             };
 
-            eventSource.onerror = function() {
-                eventSource.close();
+            currentEventSource.onerror = function() {
+                currentEventSource.close();
+                currentEventSource = null;
                 statusEl.textContent = "Estado: Finalizado / Inactivo";
                 buttons.forEach(b => b.disabled = false);
                 consoleEl.textContent += "\n[PROCESO FINALIZADO]";
@@ -214,16 +226,23 @@ def run_script(script_key):
     cmd = SCRIPTS[script_key]["cmd"]
 
     def generate():
+        env = os.environ.copy()
+        env["PYTHONUNBUFFERED"] = "1"
+
         process = subprocess.Popen(
             cmd,
             stdout=subprocess.PIPE,
             stderr=subprocess.STDOUT,
             text=True,
-            bufsize=1
+            bufsize=1,
+            env=env
         )
+
         for line in iter(process.stdout.readline, ''):
             if line:
-                yield f"data: {line.strip()}\n\n"
+                # Transmite en formato Server-Sent Events (SSE) al navegador
+                yield f"data: {line.rstrip()}\n\n"
+
         process.stdout.close()
         process.wait()
 
