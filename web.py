@@ -22,27 +22,27 @@ SCRIPTS = {
     "pipeline": {
         "title": "🎵 Ejecutar Audio Pipeline",
         "desc": "Procesa metadatos en Staging y mueve la música limpia a la biblioteca organizada",
-        "cmd": [VENV_PYTHON, "-u", "scripts/audio_pipeline.py"]
+        "cmd": [VENV_PYTHON, "-u", "/home/escriva/Navidrome-pipeline/scripts/audio_pipeline.py"]
     },
     "bpm": {
         "title": "🥁 Analizar BPM",
         "desc": "Calcula e incrusta el tempo (BPM) en los metadatos ID3 usando Essentia/Librosa",
-        "cmd": [VENV_PYTHON, "-u", "scripts/bpm.py"]
+        "cmd": [VENV_PYTHON, "-u", "/home/escriva/Navidrome-pipeline/scripts/bpm.py"]
     },
     "autostar": {
         "title": "⭐ AutoStar Navidrome",
         "desc": "Califica o marca con estrellas automáticamente las canciones/álbumes según reproducción",
-        "cmd": [VENV_PYTHON, "-u", "scripts/autostar.py"]
+        "cmd": [VENV_PYTHON, "-u", "/home/escriva/Navidrome-pipeline/scripts/autostar.py"]
     },
     "covers": {
         "title": "🖼️ Descargar Carátulas (MBZ → IT → DG)",
         "desc": "Búsqueda en cascada de portadas de los álbumes de Navidrome e incrustado en ID3 / cover.jpg",
-        "cmd": [VENV_PYTHON, "-u", "scripts/download_covers.py"]
+        "cmd": [VENV_PYTHON, "-u", "/home/escriva/Navidrome-pipeline/scripts/download_covers.py"]
     },
     "wantlist": {
         "title": "📋 Wantlist Discogs desde Navidrome",
         "desc": "Sincroniza álbumes de tus playlists de Navidrome directamente con tu Wantlist de Discogs",
-        "cmd": [VENV_PYTHON, "-u", "scripts/wantlist_from_navidrome.py"]
+        "cmd": [VENV_PYTHON, "-u", "/home/escriva/Navidrome-pipeline/scripts/wantlist_from_navidrome.py"]
     },
     "clean": {
         "title": "🧹 Limpiar Carpetas Vacías / Solo cover.jpg",
