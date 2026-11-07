@@ -16,9 +16,14 @@ VENV_PYTHON = "/home/escriva/venv/bin/python3"
 # Ruta de monitoreo automático para descargas entrantes
 DOWNLOADS_PATH = "/home/escriva/music/baldman/ingresos"
 
-# Configuración de los scripts del pipeline de Navidrome
+# Configuración de los scripts del pipeline de Navidrome con su ruta completa
 # NOTA: Se añade "-u" a los comandos de Python para desactivar el buffering de stdout/stderr
 SCRIPTS = {
+    "test": {
+        "title": "🧪 Probar Consola (Print Test)",
+        "desc": "Ejecuta un comando de prueba rápido para comprobar el streaming de texto en la consola",
+        "cmd": [VENV_PYTHON, "-c", "import time; print('¡Hola! La consola web está funcionando correctamente.'); time.sleep(1); print('Prueba completada con éxito. [OK]')"]
+    },
     "pipeline": {
         "title": "🎵 Ejecutar Audio Pipeline",
         "desc": "Procesa metadatos en Staging y mueve la música limpia a la biblioteca organizada",
