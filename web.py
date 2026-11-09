@@ -1,257 +1,560 @@
+import json
 import os
-import sys
-import time
-import threading
+import re
+import signal
 import subprocess
-from pathlib import Path
-from flask import Flask, render_template_string, Response
-from watchdog.observers import Observer
-from watchdog.events import FileSystemEventHandler
+import threading
+import time
+
+from flask import Flask, Response, jsonify, render_template_string, request
 
 app = Flask(__name__)
 
-# Ruta explícita del ejecutable de Python dentro del entorno virtual (venv)
+# ---------------------------------------------------------------------------
+# CONFIGURACIÓN
+# ---------------------------------------------------------------------------
 VENV_PYTHON = "/home/escriva/venv/bin/python3"
+ORGANIZADO_PATH = "/home/escriva/music/baldman/SINFI/Organizado"
+SCRIPTS_DIR = "/home/escriva/Navidrome-pipeline/scripts"
 
-# Ruta de monitoreo automático para descargas entrantes
-DOWNLOADS_PATH = "/home/escriva/music/baldman/ingresos"
+HOST = os.environ.get("PANEL_HOST", "0.0.0.0")  # pon aquí tu IP de Tailscale para no exponerlo a toda la LAN
+PORT = int(os.environ.get("PANEL_PORT", "5001"))
 
-# Configuración de los scripts del pipeline de Navidrome con su ruta completa
-# NOTA: Se añade "-u" a los comandos de Python para desactivar el buffering de stdout/stderr
-SCRIPTS = {
-    "test": {
-        "title": "🧪 Probar Consola (Print Test)",
-        "desc": "Ejecuta un comando de prueba rápido para comprobar el streaming de texto en la consola",
-        "cmd": [VENV_PYTHON, "-c", "import time; print('¡Hola! La consola web está funcionando correctamente.'); time.sleep(1); print('Prueba completada con éxito. [OK]')"]
-    },
-    "pipeline": {
-        "title": "🎵 Ejecutar Audio Pipeline",
-        "desc": "Procesa metadatos en Staging y mueve la música limpia a la biblioteca organizada",
-        "cmd": [VENV_PYTHON, "-u", "/home/escriva/Navidrome-pipeline/scripts/audio_pipeline.py"]
-    },
-    "bpm": {
-        "title": "🥁 Analizar BPM",
-        "desc": "Calcula e incrusta el tempo (BPM) en los metadatos ID3 usando Essentia/Librosa",
-        "cmd": [VENV_PYTHON, "-u", "/home/escriva/Navidrome-pipeline/scripts/bpm.py"]
-    },
-    "autostar": {
-        "title": "⭐ AutoStar Navidrome",
-        "desc": "Califica o marca con estrellas automáticamente las canciones/álbumes según reproducción",
-        "cmd": [VENV_PYTHON, "-u", "/home/escriva/Navidrome-pipeline/scripts/autostar.py"]
-    },
-    "covers": {
-        "title": "🖼️ Descargar Carátulas (MBZ → IT → DG)",
-        "desc": "Búsqueda en cascada de portadas de los álbumes de Navidrome e incrustado en ID3 / cover.jpg",
-        "cmd": [VENV_PYTHON, "-u", "/home/escriva/Navidrome-pipeline/scripts/download_covers.py"]
-    },
-    "wantlist": {
-        "title": "📋 Wantlist Discogs desde Navidrome",
-        "desc": "Sincroniza álbumes de tus playlists de Navidrome directamente con tu Wantlist de Discogs",
-        "cmd": [VENV_PYTHON, "-u", "/home/escriva/Navidrome-pipeline/scripts/wantlist_from_navidrome.py"]
-    },
-    "clean": {
-        "title": "🧹 Limpiar Carpetas Vacías / Solo cover.jpg",
-        "desc": "Elimina directorios huérfanos o carpetas residuales en la biblioteca organizada",
-        "cmd": ["bash", "-c", '''find /home/escriva/music/baldman/SINFI/Organizado -type d -exec bash -c '
-for dir; do
+MAX_LINES = 20000           # límite de líneas guardadas por ejecución
+
+CLEAN_SCRIPT = r'''
+ROOT="$1"
+if [ ! -d "$ROOT" ]; then echo "[ERROR] No existe la ruta: $ROOT"; exit 1; fi
+removed=0
+# -depth: primero las subcarpetas, así los padres que quedan vacíos también se borran
+while IFS= read -r -d '' dir; do
   count=$(find "$dir" -mindepth 1 -maxdepth 1 | wc -l)
   if [ "$count" -eq 0 ]; then
     echo "[BORRADO] Carpeta vacía: $dir"
-    rm -rf "$dir"
-  elif [ "$count" -eq 1 ] && [ -f "$dir/cover.jpg" -o -f "$dir/COVER.JPG" -o -f "$dir/Cover.jpg" ]; then
+    rmdir -- "$dir" && removed=$((removed+1))
+  elif [ "$count" -eq 1 ] && [ -n "$(find "$dir" -mindepth 1 -maxdepth 1 -type f -iname 'cover.jpg')" ]; then
     echo "[BORRADO] Carpeta con solo cover.jpg: $dir"
-    rm -rf "$dir"
+    rm -rf -- "$dir" && removed=$((removed+1))
   fi
-done' _ {} +''']
-    }
+done < <(find "$ROOT" -mindepth 1 -depth -type d -print0)
+echo "[OK] Listo. Carpetas eliminadas: $removed"
+'''
+
+SCRIPTS = {
+    "test": {
+        "title": "🧪 Probar consola",
+        "desc": "Comando rápido para comprobar que la salida llega en tiempo real",
+        "cmd": [VENV_PYTHON, "-u", "-c",
+                "import time; print('¡Hola! La consola web funciona.'); time.sleep(1); print('Prueba completada [OK]')"],
+    },
+    "pipeline": {
+        "title": "🎵 Audio Pipeline",
+        "desc": "Procesa metadatos en Staging y mueve la música limpia a la biblioteca organizada",
+        "cmd": [VENV_PYTHON, "-u", f"{SCRIPTS_DIR}/audio_pipeline.py"],
+    },
+    "bpm": {
+        "title": "🥁 Analizar BPM",
+        "desc": "Calcula e incrusta el tempo (BPM) en los metadatos ID3 con Essentia/Librosa",
+        "cmd": [VENV_PYTHON, "-u", f"{SCRIPTS_DIR}/bpm.py"],
+    },
+    "autostar": {
+        "title": "⭐ AutoStar Navidrome",
+        "desc": "Califica con estrellas las canciones y álbumes según las reproducciones",
+        "cmd": [VENV_PYTHON, "-u", f"{SCRIPTS_DIR}/autostar.py"],
+    },
+    "covers": {
+        "title": "🖼️ Descargar carátulas",
+        "desc": "Busca portadas en cascada (MBZ → IT → DG) y las incrusta en ID3 / cover.jpg",
+        "cmd": [VENV_PYTHON, "-u", f"{SCRIPTS_DIR}/download_covers.py"],
+    },
+    "wantlist": {
+        "title": "📋 Wantlist de Discogs",
+        "desc": "Sincroniza los álbumes de tus playlists de Navidrome con tu Wantlist de Discogs",
+        "cmd": [VENV_PYTHON, "-u", f"{SCRIPTS_DIR}/wantlist_from_navidrome.py"],
+    },
+    "clean": {
+        "title": "🧹 Limpiar carpetas vacías",
+        "desc": "Elimina carpetas vacías o que solo contienen cover.jpg en la biblioteca organizada",
+        "cmd": ["bash", "-c", CLEAN_SCRIPT, "_", ORGANIZADO_PATH],
+        "confirm": "Esto borrará carpetas vacías o con solo cover.jpg en la biblioteca. ¿Continuar?",
+    },
 }
 
-# --- LÓGICA DE AUTO-EJECUCIÓN AL DETECTAR NUEVOS ARCHIVOS ---
-is_pipeline_running = False
+# ---------------------------------------------------------------------------
+# GESTOR DE TAREAS (una sola a la vez; la salida se comparte con todos los clientes)
+# ---------------------------------------------------------------------------
+ANSI_RE = re.compile(r"\x1b\[[0-9;?]*[ -/]*[@-~]")
 
-def run_pipeline_automatically(filepath):
-    global is_pipeline_running
-    if is_pipeline_running:
-        print(f"⚠️ Detectado nuevo archivo '{filepath}', pero el pipeline ya está ejecutándose. Omitiendo...")
-        return
+cond = threading.Condition()
+current_job = None
 
-    is_pipeline_running = True
-    print(f"\n⚡ [AUTO-TRIGGER] Nuevo archivo detectado: {filepath}")
-    print("⏳ Esperando 5 segundos a que finalice la copia/descarga del archivo...")
-    time.sleep(5)
 
-    print(f"🚀 Ejecutando Audio Pipeline automáticamente con {VENV_PYTHON}...")
+class Job:
+    def __init__(self, key):
+        self.id = int(time.time() * 1000)
+        self.key = key
+        self.title = SCRIPTS[key]["title"]
+        self.lines = []
+        self.truncated = False
+        self.running = True
+        self.returncode = None
+        self.proc = None
+        self.started = time.time()
+        self.finished = None
+
+    def info(self):
+        end = self.finished or time.time()
+        return {
+            "id": self.id,
+            "key": self.key,
+            "title": self.title,
+            "running": self.running,
+            "elapsed": round(end - self.started, 1),
+        }
+
+
+def push(job, text):
+    text = ANSI_RE.sub("", text)
+    with cond:
+        if len(job.lines) < MAX_LINES:
+            job.lines.append(text)
+        elif not job.truncated:
+            job.truncated = True
+            job.lines.append("[... salida truncada ...]")
+        cond.notify_all()
+
+
+def _run_job(job):
+    rc = -1
     try:
-        cmd = SCRIPTS["pipeline"]["cmd"]
-        env = os.environ.copy()
-        env["PYTHONUNBUFFERED"] = "1"  # Desactiva buffering en variables de entorno
-
-        process = subprocess.Popen(
-            cmd,
+        push(job, f"> {job.title}")
+        push(job, "-" * 40)
+        env = {**os.environ, "PYTHONUNBUFFERED": "1"}
+        proc = subprocess.Popen(
+            SCRIPTS[job.key]["cmd"],
             stdout=subprocess.PIPE,
             stderr=subprocess.STDOUT,
             text=True,
+            errors="replace",
             bufsize=1,
-            env=env
+            env=env,
+            start_new_session=True,  # permite parar también los procesos hijos
         )
-        for line in iter(process.stdout.readline, ''):
-            if line:
-                print(f"[AUTO-PIPELINE] {line.strip()}", flush=True)
-        process.stdout.close()
-        process.wait()
-        print("✅ [AUTO-TRIGGER] Pipeline finalizado con éxito.\n", flush=True)
-    except Exception as e:
-        print(f"❌ [AUTO-TRIGGER] Error ejecutando el pipeline automático: {e}\n", flush=True)
+        job.proc = proc
+        for line in proc.stdout:
+            push(job, line.rstrip("\n"))
+        proc.stdout.close()
+        rc = proc.wait()
+    except Exception as exc:  # noqa: BLE001
+        push(job, f"[ERROR] No se pudo ejecutar la tarea: {exc}")
     finally:
-        is_pipeline_running = False
+        with cond:
+            job.running = False
+            job.returncode = rc
+            job.finished = time.time()
+            cond.notify_all()
 
-class AutoPipelineHandler(FileSystemEventHandler):
-    def on_created(self, event):
-        if event.is_directory:
-            return
-        filename = Path(event.src_path).name
-        if filename.startswith(".") or filename.endswith(".tmp") or filename.endswith(".part"):
-            return
 
-        threading.Thread(target=run_pipeline_automatically, args=(event.src_path,), daemon=True).start()
+def start_job(key):
+    global current_job
+    with cond:
+        if current_job is not None and current_job.running:
+            return None
+        job = Job(key)
+        current_job = job
+        cond.notify_all()
+    threading.Thread(target=_run_job, args=(job,), daemon=True).start()
+    return job
 
-def start_folder_watcher():
-    path_to_watch = DOWNLOADS_PATH
-    if not os.path.exists(path_to_watch):
-        os.makedirs(path_to_watch, exist_ok=True)
 
-    event_handler = AutoPipelineHandler()
-    observer = Observer()
-    observer.schedule(event_handler, path=path_to_watch, recursive=True)
-    observer.start()
-    print(f"👁️ Monitor activo escuchando cambios en: {path_to_watch}", flush=True)
+def stop_job():
+    with cond:
+        job = current_job
+    if job is None or not job.running or job.proc is None:
+        return False
+    try:
+        os.killpg(job.proc.pid, signal.SIGTERM)
+    except ProcessLookupError:
+        return False
+    push(job, "[DETENIDO] Tarea cancelada desde el panel")
+    return True
 
-start_folder_watcher()
 
-# --- DISEÑO HTML CON SALIDA DE CONSOLA EN TIEMPO REAL ---
-HTML_LAYOUT = """
+# ---------------------------------------------------------------------------
+# INTERFAZ
+# ---------------------------------------------------------------------------
+HTML_LAYOUT = r"""
 <!DOCTYPE html>
 <html lang="es">
 <head>
-    <meta charset="UTF-8">
-    <meta name="viewport" content="width=device-width, initial-scale=1.0">
-    <title>Navidrome Pipeline Control</title>
-    <style>
-        body { font-family: system-ui, -apple-system, sans-serif; background-color: #121212; color: #e0e0e0; margin: 0; padding: 20px; }
-        .container { max-width: 950px; margin: 0 auto; }
-        h1 { color: #fff; margin-bottom: 5px; }
-        p.subtitle { color: #888; margin-top: 0; margin-bottom: 15px; }
-        .status-badge { display: inline-block; background: #1b3a20; color: #00ff66; border: 1px solid #2e6635; padding: 6px 12px; border-radius: 20px; font-size: 0.85rem; margin-bottom: 25px; }
-        .grid { display: grid; grid-template-columns: repeat(auto-fit, minmax(280px, 1fr)); gap: 15px; margin-bottom: 25px; }
-        .card { background: #1e1e1e; border: 1px solid #333; border-radius: 8px; padding: 15px; display: flex; flex-direction: column; justify-content: space-between; }
-        .card h3 { margin-top: 0; margin-bottom: 8px; font-size: 1.1rem; }
-        .card p { color: #aaa; font-size: 0.85rem; margin: 0 0 15px 0; flex-grow: 1; }
-        .btn { background: #007bff; color: white; border: none; padding: 10px 15px; border-radius: 5px; cursor: pointer; font-weight: bold; text-align: center; text-decoration: none; }
-        .btn:hover { background: #0056b3; }
-        .btn:disabled { background: #444; cursor: not-allowed; }
-        .console-container { background: #0d0d0d; border: 1px solid #333; border-radius: 8px; padding: 15px; }
-        .console-header { display: flex; justify-content: space-between; align-items: center; margin-bottom: 10px; border-bottom: 1px solid #222; padding-bottom: 8px; }
-        .console-status { font-size: 0.85rem; color: #888; }
-        pre#console { background: transparent; color: #00ff66; padding: 0; margin: 0; font-family: monospace; font-size: 0.85rem; height: 400px; overflow-y: auto; white-space: pre-wrap; word-break: break-all; }
-    </style>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1, viewport-fit=cover">
+<meta name="theme-color" content="#101214">
+<title>Navidrome Pipeline Control</title>
+{% raw %}
+<style>
+  :root {
+    --bg: #101214; --panel: #181b1f; --line: #2b3036; --text: #e7e9ec; --muted: #8e97a3;
+    --accent: #2f7df6; --accent-hover: #4a8ff7; --ok: #3ddc84; --warn: #f5b942; --err: #ff6b6b;
+    --console-bg: #0b0c0d; --console-text: #7dffb0;
+    color-scheme: dark;
+  }
+  * { box-sizing: border-box; }
+  html { -webkit-text-size-adjust: 100%; }
+  body {
+    margin: 0; background: var(--bg); color: var(--text);
+    font-family: system-ui, -apple-system, "Segoe UI", Roboto, sans-serif; line-height: 1.45;
+    padding: max(16px, env(safe-area-inset-top)) max(16px, env(safe-area-inset-right))
+             max(24px, env(safe-area-inset-bottom)) max(16px, env(safe-area-inset-left));
+  }
+  .container { max-width: 1000px; margin: 0 auto; }
+  header { margin-bottom: 20px; }
+  h1 { margin: 0 0 4px; font-size: clamp(1.35rem, 4.5vw, 1.9rem); }
+  .subtitle { margin: 0 0 14px; color: var(--muted); font-size: clamp(.85rem, 2.6vw, .95rem); }
+
+  .grid {
+    display: grid; gap: 14px; margin-bottom: 22px;
+    grid-template-columns: repeat(auto-fill, minmax(min(100%, 260px), 1fr));
+  }
+  .card {
+    background: var(--panel); border: 1px solid var(--line); border-radius: 10px; padding: 16px;
+    display: flex; flex-direction: column; justify-content: space-between; gap: 14px;
+  }
+  .card h3 { margin: 0 0 6px; font-size: 1.05rem; }
+  .card p { margin: 0; color: var(--muted); font-size: .88rem; }
+
+  .btn {
+    appearance: none; border: 0; border-radius: 8px; cursor: pointer; font: inherit; font-weight: 600;
+    min-height: 44px; padding: 0 16px; color: #fff; background: var(--accent);
+    transition: background .15s;
+  }
+  .btn:hover:not(:disabled) { background: var(--accent-hover); }
+  .btn:disabled { background: #343a42; color: #7d8590; cursor: not-allowed; }
+  .btn.ghost { background: transparent; border: 1px solid var(--line); color: var(--text); font-weight: 500; }
+  .btn.ghost:hover:not(:disabled) { background: #22262b; }
+  .btn.danger { background: #b3363a; }
+  .btn.danger:hover:not(:disabled) { background: #cc4448; }
+  .btn.small { min-height: 38px; padding: 0 12px; font-size: .88rem; }
+  .btn:focus-visible { outline: 2px solid #9cc2ff; outline-offset: 2px; }
+
+  .console-box { background: var(--console-bg); border: 1px solid var(--line); border-radius: 10px; overflow: hidden; }
+  .console-head {
+    display: flex; flex-wrap: wrap; align-items: center; justify-content: space-between; gap: 10px;
+    padding: 12px 14px; border-bottom: 1px solid #1e2226;
+  }
+  .console-title { display: flex; align-items: center; gap: 10px; min-width: 0; flex: 1 1 260px; }
+  .console-title strong { white-space: nowrap; }
+  #state { color: var(--muted); font-size: .85rem; overflow-wrap: anywhere; }
+  .actions { display: flex; gap: 8px; flex-wrap: wrap; }
+  .dot { width: 10px; height: 10px; border-radius: 50%; flex: none; background: #596069; }
+  .dot.busy { background: var(--warn); animation: pulse 1.2s ease-in-out infinite; }
+  .dot.ok { background: var(--ok); }
+  .dot.err { background: var(--err); }
+  @keyframes pulse { 50% { opacity: .35; } }
+
+  pre#console {
+    margin: 0; padding: 14px; color: var(--console-text);
+    font: .85rem/1.5 ui-monospace, SFMono-Regular, Menlo, Consolas, monospace;
+    height: 420px; height: clamp(260px, 55dvh, 560px);
+    overflow: auto; white-space: pre-wrap; overflow-wrap: anywhere;
+    overscroll-behavior: contain; -webkit-overflow-scrolling: touch;
+  }
+  pre#console:empty::before { content: attr(data-empty); color: #5d6671; }
+  pre#console .err { color: var(--err); }
+  pre#console .warn { color: var(--warn); }
+  pre#console .ok { color: var(--ok); }
+
+  #conn {
+    display: none; margin: 0 14px 12px; padding: 6px 10px; border-radius: 6px;
+    background: #3a2d12; color: var(--warn); font-size: .82rem;
+  }
+  #conn.show { display: block; }
+  #toast {
+    position: fixed; left: 50%; bottom: max(20px, env(safe-area-inset-bottom)); transform: translateX(-50%);
+    background: #2a2f36; border: 1px solid var(--line); color: var(--text);
+    padding: 10px 16px; border-radius: 8px; font-size: .9rem; max-width: calc(100% - 32px);
+    opacity: 0; pointer-events: none; transition: opacity .2s;
+  }
+  #toast.show { opacity: 1; }
+
+  @media (max-width: 520px) {
+    .card { padding: 14px; }
+    .card .btn { width: 100%; }
+    .actions { width: 100%; }
+    .actions .btn { flex: 1; }
+    pre#console { padding: 12px; font-size: .8rem; }
+  }
+  @media (prefers-reduced-motion: reduce) {
+    .dot.busy { animation: none; }
+    .btn, #toast { transition: none; }
+  }
+</style>
+{% endraw %}
 </head>
 <body>
-    <div class="container">
-        <h1>🎛️ Navidrome Pipeline Control</h1>
-        <p class="subtitle">Panel Web de gestión de scripts accesible por Tailscale</p>
-        <div class="status-badge">🟢 Auto-Monitor Activo: <code>/home/escriva/music/baldman/ingresos</code></div>
+<div class="container">
+  <header>
+    <h1>🎛️ Navidrome Pipeline Control</h1>
+    <p class="subtitle" style="margin-bottom:0">Gestión de scripts accesible por Tailscale</p>
+  </header>
 
-        <div class="grid">
-            {% for key, script in scripts.items() %}
-            <div class="card">
-                <div>
-                    <h3>{{ script.title }}</h3>
-                    <p>{{ script.desc }}</p>
-                </div>
-                <button class="btn" onclick="runScript('{{ key }}')">Ejecutar</button>
-            </div>
-            {% endfor %}
-        </div>
+  <section class="grid" id="grid" aria-label="Tareas disponibles">
+    {% for s in scripts %}
+    <article class="card">
+      <div>
+        <h3>{{ s.title }}</h3>
+        <p>{{ s.desc }}</p>
+      </div>
+      <button type="button" class="btn run" data-key="{{ s.key }}" data-confirm="{{ s.confirm }}">Ejecutar</button>
+    </article>
+    {% endfor %}
+  </section>
 
-        <div class="console-container">
-            <div class="console-header">
-                <strong>Salida de Consola en Tiempo Real</strong>
-                <span id="status" class="console-status">Estado: Inactivo</span>
-            </div>
-            <pre id="console">> Presiona un botón para ejecutar una tarea manualmente...</pre>
-        </div>
+  <section class="console-box" aria-label="Salida de consola">
+    <div class="console-head">
+      <div class="console-title">
+        <span id="dot" class="dot"></span>
+        <strong>Consola</strong>
+        <span id="state" role="status" aria-live="polite">Inactivo</span>
+      </div>
+      <div class="actions">
+        <button type="button" id="stop" class="btn danger small" disabled>Detener</button>
+        <button type="button" id="copy" class="btn ghost small">Copiar</button>
+        <button type="button" id="clear" class="btn ghost small">Limpiar</button>
+      </div>
     </div>
+    <div id="conn">Conexión perdida, reconectando…</div>
+    <pre id="console" data-empty="Pulsa «Ejecutar» en una tarea para ver aquí su salida."></pre>
+  </section>
+</div>
+<div id="toast" role="status" aria-live="polite"></div>
 
-    <script>
-        let currentEventSource = null;
+{% raw %}
+<script>
+  const $ = (s) => document.querySelector(s);
+  const out = $("#console"), stateEl = $("#state"), dotEl = $("#dot"), connEl = $("#conn");
+  const stopBtn = $("#stop"), runBtns = [...document.querySelectorAll(".run")];
+  const MAX_NODES = 3000;
+  let ticker = null, queue = [], raf = 0, toastTimer = null;
 
-        function runScript(key) {
-            const consoleEl = document.getElementById("console");
-            const statusEl = document.getElementById("status");
-            const buttons = document.querySelectorAll(".btn");
+  const fmt = (s) => { s = Math.round(s); const m = Math.floor(s / 60); return m ? `${m}m ${s % 60}s` : `${s}s`; };
 
-            if (currentEventSource) {
-                currentEventSource.close();
-            }
+  function classify(t) {
+    if (/error|traceback|exception|❌/i.test(t)) return "err";
+    if (/warn|⚠️|\[DETENIDO\]/i.test(t)) return "warn";
+    if (/\[OK\]|✅/.test(t)) return "ok";
+    return "";
+  }
 
-            buttons.forEach(b => b.disabled = true);
-            consoleEl.textContent = `> Iniciando ejecución de ${key}...\n----------------------------------------\n`;
-            statusEl.textContent = "Estado: Ejecutando...";
+  function addLine(text) {
+    queue.push(text);
+    if (!raf) raf = requestAnimationFrame(flush);
+  }
 
-            currentEventSource = new EventSource(`/run/${key}`);
+  function flush() {
+    raf = 0;
+    const nearBottom = out.scrollHeight - out.scrollTop - out.clientHeight < 40;
+    const frag = document.createDocumentFragment();
+    for (const t of queue) {
+      const span = document.createElement("span");
+      const c = classify(t);
+      if (c) span.className = c;
+      span.textContent = t + "\n";
+      frag.appendChild(span);
+    }
+    queue = [];
+    out.appendChild(frag);
+    while (out.childElementCount > MAX_NODES) out.firstElementChild.remove();
+    if (nearBottom) out.scrollTop = out.scrollHeight;
+  }
 
-            currentEventSource.onmessage = function(event) {
-                consoleEl.textContent += event.data + "\n";
-                consoleEl.scrollTop = consoleEl.scrollHeight;
-            };
+  function toast(msg) {
+    const el = $("#toast");
+    el.textContent = msg;
+    el.classList.add("show");
+    clearTimeout(toastTimer);
+    toastTimer = setTimeout(() => el.classList.remove("show"), 3000);
+  }
 
-            currentEventSource.onerror = function() {
-                currentEventSource.close();
-                currentEventSource = null;
-                statusEl.textContent = "Estado: Finalizado / Inactivo";
-                buttons.forEach(b => b.disabled = false);
-                consoleEl.textContent += "\n[PROCESO FINALIZADO]";
-                consoleEl.scrollTop = consoleEl.scrollHeight;
-            };
-        }
-    </script>
+  function setRunning(running, job) {
+    runBtns.forEach((b) => (b.disabled = running));
+    stopBtn.disabled = !running;
+    clearInterval(ticker);
+    dotEl.className = "dot" + (running ? " busy" : "");
+    if (!running) return;
+    const start = performance.now() - job.elapsed * 1000;
+    const tick = () => { stateEl.textContent = `Ejecutando ${job.title} · ${fmt((performance.now() - start) / 1000)}`; };
+    tick();
+    ticker = setInterval(tick, 1000);
+  }
+
+  function connect() {
+    const es = new EventSource("/stream");   // reconecta solo y retoma desde el último evento
+
+    es.onopen = () => connEl.classList.remove("show");
+
+    es.addEventListener("job", (e) => {
+      const job = JSON.parse(e.data);
+      out.replaceChildren();
+      queue = [];
+      setRunning(job.running, job);
+      if (!job.running) stateEl.textContent = job.title;
+    });
+
+    es.onmessage = (e) => addLine(JSON.parse(e.data));
+
+    es.addEventListener("done", (e) => {
+      const d = JSON.parse(e.data);
+      setRunning(false);
+      if (d.returncode === 0) {
+        dotEl.className = "dot ok";
+        stateEl.textContent = `Finalizado correctamente (${fmt(d.elapsed)})`;
+      } else if (d.returncode < 0) {
+        dotEl.className = "dot err";
+        stateEl.textContent = `Detenido (${fmt(d.elapsed)})`;
+      } else {
+        dotEl.className = "dot err";
+        stateEl.textContent = `Terminó con error, código ${d.returncode} (${fmt(d.elapsed)})`;
+      }
+    });
+
+    es.onerror = () => {
+      connEl.classList.add("show");
+      if (es.readyState === EventSource.CLOSED) setTimeout(connect, 3000);
+    };
+  }
+
+  async function post(url) {
+    try {
+      const r = await fetch(url, { method: "POST" });
+      if (r.status === 409) { toast("Ya hay una tarea en ejecución."); return false; }
+      if (!r.ok) throw new Error("HTTP " + r.status);
+      return true;
+    } catch (err) {
+      toast("No se pudo completar la acción: " + err.message);
+      return false;
+    }
+  }
+
+  $("#grid").addEventListener("click", async (e) => {
+    const btn = e.target.closest(".run");
+    if (!btn || btn.disabled) return;
+    if (btn.dataset.confirm && !confirm(btn.dataset.confirm)) return;
+    if (await post(`/run/${btn.dataset.key}`)) {
+      const calm = matchMedia("(prefers-reduced-motion: reduce)").matches;
+      out.scrollIntoView({ behavior: calm ? "auto" : "smooth", block: "center" });
+    }
+  });
+
+  stopBtn.addEventListener("click", () => post("/stop"));
+  $("#clear").addEventListener("click", () => { out.replaceChildren(); queue = []; });
+
+  $("#copy").addEventListener("click", async () => {
+    const text = out.textContent;
+    try {
+      await navigator.clipboard.writeText(text);
+    } catch {
+      // Sin HTTPS (p. ej. http://IP-tailscale) navigator.clipboard no existe: usamos el método clásico
+      const ta = document.createElement("textarea");
+      ta.value = text; ta.style.position = "fixed"; ta.style.opacity = "0";
+      document.body.appendChild(ta); ta.select();
+      document.execCommand("copy"); ta.remove();
+    }
+    toast("Salida copiada");
+  });
+
+  connect();
+</script>
+{% endraw %}
 </body>
 </html>
 """
 
+
+def sse(data, event=None, id=None):
+    msg = ""
+    if id:
+        msg += f"id: {id}\n"
+    if event:
+        msg += f"event: {event}\n"
+    msg += f"data: {json.dumps(data, ensure_ascii=False)}\n\n"
+    return msg
+
+
 @app.route("/")
 def index():
-    return render_template_string(HTML_LAYOUT, scripts=SCRIPTS)
+    scripts = [
+        {"key": k, "title": v["title"], "desc": v["desc"], "confirm": v.get("confirm", "")}
+        for k, v in SCRIPTS.items()
+    ]
+    return render_template_string(HTML_LAYOUT, scripts=scripts)
 
-@app.route("/run/<script_key>")
+
+@app.route("/run/<script_key>", methods=["POST"])
 def run_script(script_key):
     if script_key not in SCRIPTS:
-        return Response("Script no válido", status=400)
+        return jsonify(error="Script no válido"), 404
+    job = start_job(script_key)
+    if job is None:
+        return jsonify(error="Ya hay una tarea en ejecución"), 409
+    return jsonify(job.info())
 
-    cmd = SCRIPTS[script_key]["cmd"]
 
-    def generate():
-        env = os.environ.copy()
-        env["PYTHONUNBUFFERED"] = "1"
+@app.route("/stop", methods=["POST"])
+def stop():
+    return jsonify(stopped=stop_job())
 
-        process = subprocess.Popen(
-            cmd,
-            stdout=subprocess.PIPE,
-            stderr=subprocess.STDOUT,
-            text=True,
-            bufsize=1,
-            env=env
-        )
 
-        for line in iter(process.stdout.readline, ''):
-            if line:
-                # Transmite en formato Server-Sent Events (SSE) al navegador
-                yield f"data: {line.rstrip()}\n\n"
+@app.route("/status")
+def status():
+    with cond:
+        job = current_job
+    return jsonify(job.info() if job else {"running": False})
 
-        process.stdout.close()
-        process.wait()
 
-    return Response(generate(), mimetype="text/event-stream")
+@app.route("/stream")
+def stream():
+    """Server-Sent Events: envía la salida de la tarea actual.
+    Al reconectar, retoma desde el último evento recibido (cabecera Last-Event-ID)."""
+    seen_job, idx = 0, 0
+    last = request.headers.get("Last-Event-ID", "")
+    if ":" in last:
+        try:
+            a, b = last.split(":", 1)
+            seen_job, idx = int(a), int(b)
+        except ValueError:
+            pass
+
+    def gen():
+        nonlocal seen_job, idx
+        done_sent = None
+        yield "retry: 3000\n\n"
+        while True:
+            chunks = []
+            with cond:
+                job = current_job
+                if job is not None:
+                    if job.id != seen_job:
+                        seen_job, idx = job.id, 0
+                        chunks.append(sse(job.info(), "job"))
+                    while idx < len(job.lines):
+                        idx += 1
+                        chunks.append(sse(job.lines[idx - 1], id=f"{job.id}:{idx}"))
+                    if not job.running and done_sent != job.id:
+                        done_sent = job.id
+                        info = job.info()
+                        chunks.append(sse(
+                            {"returncode": job.returncode, "elapsed": info["elapsed"]},
+                            "done", id=f"{job.id}:{idx}"))
+                if not chunks:
+                    if not cond.wait(timeout=15):
+                        chunks.append(": ping\n\n")  # latido para detectar clientes desconectados
+            for chunk in chunks:
+                yield chunk
+
+    headers = {"Cache-Control": "no-cache", "X-Accel-Buffering": "no"}
+    return Response(gen(), mimetype="text/event-stream", headers=headers)
+
 
 if __name__ == "__main__":
-    app.run(host="0.0.0.0", port=5000)
+    app.run(host=HOST, port=PORT, threaded=True, debug=False)
