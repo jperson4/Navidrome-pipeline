@@ -6,9 +6,9 @@ Moves the songs of Navidrome playlists into a specific folder per playlist.
 Edit PLAYLIST_FOLDERS below to configure which playlist goes where.
 
 Navidrome returns each song's path relative to its library folder
-(e.g. "Artist/Album/01 - Song.mp3") but NOT which of the subfolders of
-MUSIC_ROOT it lives in (bandcamp, BORRAR, DJ, ...). The subfolders are
-discovered automatically from MUSIC_ROOT and each one is tried until the
+(e.g. "Artist/Album/01 - Song.mp3" or "/music/Organizado/Artist/Album/01 - Song.mp3")
+but NOT which of the subfolders of MUSIC_ROOT it lives in (bandcamp, BORRAR, DJ, ...).
+The subfolders are discovered automatically from MUSIC_ROOT and each one is tried until the
 file is found. If the same relative path exists in several subfolders, the
 file size reported by Navidrome is used to pick the right one; if it's still
 ambiguous the song is SKIPPED (never guessed).
@@ -45,10 +45,8 @@ load_dotenv()
 # ═════════════════════════════════════════════════════════════════════════════
 
 # Folder that contains all your main subfolders (bandcamp, BORRAR, DJ, SINFI, etc.).
-# Reads MUSIC_PATH or MUSIC_BASE_ROOT, falling back to /home/escriva/music/baldman
-_env_path = os.getenv("MUSIC_BASE_ROOT") or os.getenv("MUSIC_PATH", "/home/escriva/music/baldman")
-# If MUSIC_PATH points to a subfolder (e.g. .../SINFI/Organizado), adjust to base root if needed:
-MUSIC_ROOT = os.getenv("MUSIC_BASE_ROOT", "/home/escriva/music/baldman")
+# Reads MUSIC_BASE_ROOT or MUSIC_PATH, falling back to /home/escriva/music/baldman
+MUSIC_ROOT = os.getenv("MUSIC_BASE_ROOT") or os.getenv("MUSIC_PATH", "/home/escriva/music/baldman")
 
 # "Playlist name in Navidrome": "Destination folder"
 #   - A relative folder is taken relative to MUSIC_ROOT ("BORRAR" -> MUSIC_ROOT/BORRAR)
@@ -151,12 +149,11 @@ def get_roots(music_root: Path) -> list[Path]:
     """Descubre todas las subcarpetas principales conocidas y cualquier subdirectorio
     existente bajo MUSIC_ROOT para resolver las rutas relativas de Navidrome."""
     roots = []
-    # 1. Carpetas principales declaradas
+    # 1. Carpetas principales declaradas y sus subdirectorios "Organizado"
     for folder in MAIN_FOLDERS:
         p = music_root / folder
         if p.is_dir() and p not in roots:
             roots.append(p)
-            # También añadir posible subdirectorio Organizado si existe
             org = p / "Organizado"
             if org.is_dir() and org not in roots:
                 roots.append(org)
@@ -165,6 +162,9 @@ def get_roots(music_root: Path) -> list[Path]:
     for p in sorted(music_root.iterdir()):
         if p.is_dir() and p not in roots:
             roots.append(p)
+            org = p / "Organizado"
+            if org.is_dir() and org not in roots:
+                roots.append(org)
 
     # 3. La propia raíz al final
     roots.append(music_root)
@@ -176,17 +176,37 @@ def resolve_dest(folder: str, music_root: Path) -> Path:
     return (p if p.is_absolute() else music_root / p).resolve()
 
 
+def clean_rel_path(rel_path: str) -> list[str]:
+    """Limpia prefijos montados por el contenedor (ej: /music/, /music/Organizado/)
+    y devuelve varias alternativas de ruta relativa para probar en disco."""
+    p = rel_path.replace("\\", "/").strip("/")
+    
+    candidates = [p]
+    
+    # Si Navidrome devuelve prefijos virtuales como music/Organizado/... o music/...
+    prefixes = ["music/Organizado/", "music/", "Organizado/"]
+    for prefix in prefixes:
+        if p.lower().startswith(prefix.lower()):
+            candidates.append(p[len(prefix):])
+
+    # Eliminar duplicados manteniendo el orden
+    seen = set()
+    return [x for x in candidates if not (x in seen or seen.add(x))]
+
+
 def find_song_file(rel_path: str, size: int | None, roots: list[Path]) -> tuple[Path | None, str]:
     """Returns (file, status) where status is "ok" | "missing" | "ambiguous"."""
-    rel = rel_path.lstrip("/")
+    rel_variants = clean_rel_path(rel_path)
     found: list[Path] = []
 
-    for root in roots:
-        candidate = root / rel
-        if candidate.is_file():
-            resolved = candidate.resolve()
-            if resolved not in found:
-                found.append(resolved)
+    for rel in rel_variants:
+        rel_p = Path(rel)
+        for root in roots:
+            candidate = root / rel_p
+            if candidate.is_file():
+                resolved = candidate.resolve()
+                if resolved not in found:
+                    found.append(resolved)
 
     if not found:
         return None, "missing"
@@ -318,8 +338,9 @@ def main() -> None:
                 already += 1
                 continue
 
-            rel = Path(rel_path.lstrip("/"))
-            target_dir = dest / rel.parent if KEEP_STRUCTURE else dest
+            rel_variants = clean_rel_path(rel_path)
+            rel_clean = Path(rel_variants[-1])
+            target_dir = dest / rel_clean.parent if KEEP_STRUCTURE else dest
             target = unique_path(target_dir, src.name)
 
             try:
