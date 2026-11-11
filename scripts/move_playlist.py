@@ -20,12 +20,8 @@ Usage:
     python move_playlist.py --list                # list Navidrome playlists
     python move_playlist.py --dry-run             # simulate
     python move_playlist.py                       # move for real
-    python move_playlist.py -p "Para borrar"      # only that playlist (repeatable)
+    python move_playlist.py -p "_BORRAR"          # only that playlist (repeatable)
     python move_playlist.py --scan                # trigger a Navidrome scan afterwards
-
-NOTE: Navidrome identifies songs by path, so after moving them it needs a
-rescan (use --scan, or scan from the web UI). Moved songs may disappear from
-the playlists they were in, since the "new" files are new tracks for it.
 """
 
 from __future__ import annotations
@@ -48,12 +44,14 @@ load_dotenv()
 #  CONFIGURATION  (edit this block)
 # ═════════════════════════════════════════════════════════════════════════════
 
-# Folder that contains all your subfolders (bandcamp, BORRAR, DJ, ...).
-# Comes from .env:  MUSIC_PATH="/mnt/bde/baldman/"
-MUSIC_ROOT = os.getenv("MUSIC_PATH")
+# Folder that contains all your main subfolders (bandcamp, BORRAR, DJ, SINFI, etc.).
+# Reads MUSIC_PATH or MUSIC_BASE_ROOT, falling back to /home/escriva/music/baldman
+_env_path = os.getenv("MUSIC_BASE_ROOT") or os.getenv("MUSIC_PATH", "/home/escriva/music/baldman")
+# If MUSIC_PATH points to a subfolder (e.g. .../SINFI/Organizado), adjust to base root if needed:
+MUSIC_ROOT = os.getenv("MUSIC_BASE_ROOT", "/home/escriva/music/baldman")
 
 # "Playlist name in Navidrome": "Destination folder"
-#   - A relative folder is taken relative to MUSIC_ROOT  ("BORRAR" -> MUSIC_ROOT/BORRAR)
+#   - A relative folder is taken relative to MUSIC_ROOT ("BORRAR" -> MUSIC_ROOT/BORRAR)
 #   - An absolute path is used as is
 # Playlist names are matched ignoring case and accents.
 PLAYLIST_FOLDERS = {
@@ -61,6 +59,18 @@ PLAYLIST_FOLDERS = {
     "_CIBELES": "CIBELES",
     "_BRAKES":  "BRAKES",
 }
+
+# Carpetas principales conocidas dentro de MUSIC_ROOT
+MAIN_FOLDERS = [
+    "bandcamp",
+    "BORRAR",
+    "BRAKES",
+    "CIBELES",
+    "DESCARTES",
+    "DJ",
+    "ingresos",
+    "SINFI"
+]
 
 # True  -> keep the Artist/Album/... structure inside the destination
 # False -> put every file directly in the destination folder
@@ -77,7 +87,7 @@ CLIENT              = "move-playlist-script"
 if not all([SERVER_URL_PRIMARY, USERNAME, PASSWORD, MUSIC_ROOT]):
     raise SystemExit(
         "Missing required .env variables: NAVIDROME_URL, NAVIDROME_USER, "
-        "NAVIDROME_PASSWORD, MUSIC_PATH"
+        "NAVIDROME_PASSWORD, MUSIC_PATH or MUSIC_BASE_ROOT"
     )
 
 SERVER_URL = SERVER_URL_PRIMARY
@@ -138,10 +148,27 @@ def _normalize(text: str) -> str:
 
 
 def get_roots(music_root: Path) -> list[Path]:
-    """Every subfolder of MUSIC_ROOT, plus MUSIC_ROOT itself (in case the
-    path Navidrome returns already includes the subfolder)."""
-    subs = sorted(p for p in music_root.iterdir() if p.is_dir())
-    return subs + [music_root]
+    """Descubre todas las subcarpetas principales conocidas y cualquier subdirectorio
+    existente bajo MUSIC_ROOT para resolver las rutas relativas de Navidrome."""
+    roots = []
+    # 1. Carpetas principales declaradas
+    for folder in MAIN_FOLDERS:
+        p = music_root / folder
+        if p.is_dir() and p not in roots:
+            roots.append(p)
+            # También añadir posible subdirectorio Organizado si existe
+            org = p / "Organizado"
+            if org.is_dir() and org not in roots:
+                roots.append(org)
+
+    # 2. Cualquier otra subcarpeta directa de MUSIC_ROOT
+    for p in sorted(music_root.iterdir()):
+        if p.is_dir() and p not in roots:
+            roots.append(p)
+
+    # 3. La propia raíz al final
+    roots.append(music_root)
+    return roots
 
 
 def resolve_dest(folder: str, music_root: Path) -> Path:
@@ -153,6 +180,7 @@ def find_song_file(rel_path: str, size: int | None, roots: list[Path]) -> tuple[
     """Returns (file, status) where status is "ok" | "missing" | "ambiguous"."""
     rel = rel_path.lstrip("/")
     found: list[Path] = []
+
     for root in roots:
         candidate = root / rel
         if candidate.is_file():
@@ -242,7 +270,7 @@ def main() -> None:
     by_name = {_normalize(pl.get("name", "")): pl for pl in playlists}
 
     print(f"Music root : {music_root}")
-    print(f"Subfolders : {', '.join(r.name for r in roots[:-1])}")
+    print(f"Subfolders : {', '.join(r.name for r in roots if r != music_root)}")
     if args.dry_run:
         print("Mode       : DRY-RUN (nothing will be moved)")
     print()
