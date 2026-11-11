@@ -49,7 +49,8 @@ load_dotenv()
 # ═════════════════════════════════════════════════════════════════════════════
 
 # Folder that contains all your subfolders (bandcamp, BORRAR, DJ, ...).
-MUSIC_ROOT = "/home/escriva/music/baldman"
+# Comes from .env:  MUSIC_PATH="/mnt/bde/baldman/"
+MUSIC_ROOT = os.getenv("MUSIC_PATH")
 
 # "Playlist name in Navidrome": "Destination folder"
 #   - A relative folder is taken relative to MUSIC_ROOT  ("BORRAR" -> MUSIC_ROOT/BORRAR)
@@ -73,9 +74,10 @@ USERNAME            = os.getenv("NAVIDROME_USER")
 PASSWORD            = os.getenv("NAVIDROME_PASSWORD")
 CLIENT              = "move-playlist-script"
 
-if not all([SERVER_URL_PRIMARY, USERNAME, PASSWORD]):
+if not all([SERVER_URL_PRIMARY, USERNAME, PASSWORD, MUSIC_ROOT]):
     raise SystemExit(
-        "Missing required .env variables: NAVIDROME_URL, NAVIDROME_USER, NAVIDROME_PASSWORD"
+        "Missing required .env variables: NAVIDROME_URL, NAVIDROME_USER, "
+        "NAVIDROME_PASSWORD, MUSIC_PATH"
     )
 
 SERVER_URL = SERVER_URL_PRIMARY
