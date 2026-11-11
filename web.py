@@ -41,12 +41,6 @@ echo "[OK] Listo. Carpetas eliminadas: $removed"
 '''
 
 SCRIPTS = {
-    "test": {
-        "title": "🧪 Probar consola",
-        "desc": "Comando rápido para comprobar que la salida llega en tiempo real",
-        "cmd": [VENV_PYTHON, "-u", "-c",
-                "import time; print('¡Hola! La consola web funciona.'); time.sleep(1); print('Prueba completada [OK]')"],
-    },
     "pipeline": {
         "title": "🎵 Audio Pipeline",
         "desc": "Procesa metadatos en Staging y mueve la música limpia a la biblioteca organizada",
@@ -56,6 +50,17 @@ SCRIPTS = {
         "title": "🥁 Analizar BPM",
         "desc": "Calcula e incrusta el tempo (BPM) en los metadatos ID3 con Essentia/Librosa",
         "cmd": [VENV_PYTHON, "-u", f"{SCRIPTS_DIR}/bpm.py"],
+    },
+    "move_dry": {
+        "title": "🔍 Simular mover playlists",
+        "desc": "Muestra qué canciones de cada playlist se moverían a su carpeta, sin tocar nada",
+        "cmd": [VENV_PYTHON, "-u", f"{SCRIPTS_DIR}/move_playlist.py", "--dry-run"],
+    },
+    "move": {
+        "title": "📦 Mover playlists a carpetas",
+        "desc": "Mueve las canciones de cada playlist a su carpeta (según PLAYLIST_FOLDERS) y reescanea Navidrome",
+        "cmd": [VENV_PYTHON, "-u", f"{SCRIPTS_DIR}/move_playlist.py", "--scan"],
+        "confirm": "Esto moverá archivos de música a otras carpetas. ¿Continuar? (conviene haber probado antes la simulación)",
     },
     "autostar": {
         "title": "⭐ AutoStar Navidrome",
