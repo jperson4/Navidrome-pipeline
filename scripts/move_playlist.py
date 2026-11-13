@@ -339,7 +339,15 @@ def main() -> None:
                 continue
 
             rel_variants = clean_rel_path(rel_path)
-            rel_clean = Path(rel_variants[-1])
+            rel_clean_str = rel_variants[-1]
+            
+            # Evitar anidar duplicando la carpeta de destino si ya viene en la ruta relativa
+            parts = Path(rel_clean_str).parts
+            if parts and _normalize(parts[0]) == _normalize(folder):
+                rel_clean = Path(*parts[1:])
+            else:
+                rel_clean = Path(rel_clean_str)
+
             target_dir = dest / rel_clean.parent if KEEP_STRUCTURE else dest
             target = unique_path(target_dir, src.name)
 
