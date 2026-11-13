@@ -104,7 +104,7 @@ FIX_EXISTING  = "--fix-existing" in sys.argv
 CLIENT  = "navidrome-sync"
 VERSION = "1.16.1"
 
-blackList = ['_DESCARTES', '_BORRAR']
+blackList = ['_DESCARTES', '_BORRAR', '_CIBELES', '_BRAKES', '_REBUSCAR']
 
 
 # ─────────────────────────────────────────────
