@@ -1,43 +1,52 @@
 import os
+import re
 import time
 import hashlib
 import secrets
+import unicodedata
 import requests
 import urllib.parse
 from pathlib import Path
 from dotenv import load_dotenv
 
+from mutagen import File as MutagenFile
 from mutagen.mp3 import MP3, HeaderNotFoundError
 from mutagen.easyid3 import EasyID3
-from mutagen.id3 import ID3, APIC, error
+from mutagen.id3 import ID3, APIC
 
 load_dotenv()
 
 NAVIDROME_URL = os.getenv("NAVIDROME_URL", "http://localhost:4533").rstrip("/")
 NAVIDROME_USER = os.getenv("NAVIDROME_USER")
-NAVIDROME_PASS = os.getenv("NAVIDROME_PASS")
+# Acepta NAVIDROME_PASSWORD (el que usan el resto de scripts) o NAVIDROME_PASS (el antiguo)
+NAVIDROME_PASS = os.getenv("NAVIDROME_PASSWORD") or os.getenv("NAVIDROME_PASS")
 DISCOGS_TOKEN = os.getenv("DISCOGS_TOKEN", None)
 
-# Directorio raíz donde residen todas las carpetas principales
-MUSIC_BASE_ROOT = Path(os.getenv("MUSIC_BASE_ROOT", "/home/escriva/music/baldman"))
+# Directorio raíz que contiene las carpetas principales (bandcamp, BORRAR, DJ, SINFI...).
+# Acepta MUSIC_BASE_ROOT o MUSIC_PATH (el mismo que usan los otros scripts).
+MUSIC_BASE_ROOT = Path(os.path.expanduser(
+    os.getenv("MUSIC_BASE_ROOT") or os.getenv("MUSIC_PATH") or "/home/escriva/music/baldman"
+))
 
-# Lista de carpetas principales conocidas
-MAIN_FOLDERS = [
-    "bandcamp",
-    "BORRAR",
-    "BRAKES",
-    "CIBELES",
-    "DESCARTES",
-    "DJ",
-    "ingresos",
-    "SINFI"
-]
+# Carpetas principales donde buscar. Por defecto se detectan solas: todas las
+# subcarpetas de MUSIC_BASE_ROOT. Para limitarlas: MAIN_FOLDERS="DJ,SINFI,CIBELES"
+MAIN_FOLDERS = [f.strip() for f in os.getenv("MAIN_FOLDERS", "").split(",") if f.strip()]
 
 WAIT_TIME = float(os.getenv("WAIT_TIME", "1.0"))
+
+# SKIP_COMPLETE=1 -> no consulta internet para álbumes que ya tienen cover.jpg e imagen incrustada
+SKIP_COMPLETE = os.getenv("SKIP_COMPLETE", "0") == "1"
+
+AUDIO_EXT = {".mp3", ".flac", ".wav", ".m4a", ".ogg", ".opus", ".aac", ".wma", ".aiff", ".aif", ".ape", ".wv"}
 
 HEADERS = {
     "User-Agent": "NavidromeCoverPipeline/1.0 (https://github.com/jperson4/Navidrome-pipeline)"
 }
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+#  NAVIDROME
+# ─────────────────────────────────────────────────────────────────────────────
 
 def get_subsonic_params() -> dict:
     salt = secrets.token_hex(6)
@@ -51,9 +60,10 @@ def get_subsonic_params() -> dict:
         "f": "json"
     }
 
+
 def get_albums_from_navidrome() -> list[dict]:
     if not NAVIDROME_USER or not NAVIDROME_PASS:
-        print("❌ Error: NAVIDROME_USER y NAVIDROME_PASS deben estar configurados en el .env")
+        print("❌ Error: NAVIDROME_USER y NAVIDROME_PASSWORD deben estar configurados en el .env")
         return []
 
     all_albums = []
@@ -69,16 +79,16 @@ def get_albums_from_navidrome() -> list[dict]:
         })
 
         url = f"{NAVIDROME_URL}/rest/getAlbumList2"
-        
+
         try:
             res = requests.get(url, params=params, headers=HEADERS, timeout=15)
             res.raise_for_status()
             data = res.json()
-            
+
             album_batch = data.get("subsonic-response", {}).get("albumList2", {}).get("album", [])
             if not album_batch:
                 break
-                
+
             all_albums.extend(album_batch)
 
             if len(album_batch) < page_size:
@@ -91,36 +101,124 @@ def get_albums_from_navidrome() -> list[dict]:
 
     return all_albums
 
-def resolve_real_album_dir(artist: str, album: str, navidrome_path: str | None) -> Path | None:
+
+def get_album_songs(session: requests.Session, album_id: str) -> list[dict]:
+    """Canciones del álbum según Navidrome (cada una con su 'path' relativo)."""
+    params = get_subsonic_params()
+    params["id"] = album_id
+    res = session.get(f"{NAVIDROME_URL}/rest/getAlbum", params=params, headers=HEADERS, timeout=15)
+    res.raise_for_status()
+    resp = res.json().get("subsonic-response", {})
+    if resp.get("status") != "ok":
+        raise RuntimeError(resp.get("error", resp))
+    songs = resp.get("album", {}).get("song", [])
+    return [songs] if isinstance(songs, dict) else songs
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+#  LOCALIZAR DÓNDE ESTÁN REALMENTE LOS ARCHIVOS
+# ─────────────────────────────────────────────────────────────────────────────
+
+def get_search_roots() -> list[Path]:
+    """Carpetas principales donde buscar música."""
+    if not MUSIC_BASE_ROOT.is_dir():
+        print(f"❌ No existe MUSIC_BASE_ROOT: {MUSIC_BASE_ROOT}")
+        return []
+    if MAIN_FOLDERS:
+        roots = []
+        for name in MAIN_FOLDERS:
+            p = MUSIC_BASE_ROOT / name
+            if p.is_dir():
+                roots.append(p)
+            else:
+                print(f"⚠️ Carpeta principal no encontrada, se ignora: {p}")
+        return roots
+    return sorted(p for p in MUSIC_BASE_ROOT.iterdir() if p.is_dir())
+
+
+def build_index(roots: list[Path]) -> tuple[dict[str, list[Path]], int]:
+    """Recorre las carpetas UNA vez y devuelve {nombre_de_archivo: [rutas donde está]}."""
+    index: dict[str, list[Path]] = {}
+    total = 0
+    for root in roots:
+        for dirpath, _dirs, files in os.walk(root):
+            for f in files:
+                if os.path.splitext(f)[1].lower() in AUDIO_EXT:
+                    index.setdefault(f.casefold(), []).append(Path(dirpath) / f)
+                    total += 1
+    return index, total
+
+
+def _norm(s: str) -> str:
+    """Compara nombres ignorando mayúsculas, acentos y símbolos."""
+    s = unicodedata.normalize("NFKD", s or "")
+    s = "".join(ch for ch in s if not unicodedata.combining(ch)).casefold()
+    return re.sub(r"[\W_]+", "", s)
+
+
+def read_album_tag(path: Path) -> str:
+    try:
+        if path.suffix.lower() == ".mp3":
+            frame = ID3(path).get("TALB")
+            return str(frame.text[0]) if frame and frame.text else ""
+        f = MutagenFile(path, easy=True)
+        return (f.tags.get("album") or [""])[0] if f and f.tags else ""
+    except Exception:
+        return ""
+
+
+def locate_song(song: dict, album_name: str, index: dict[str, list[Path]]) -> list[Path]:
     """
-    Busca en cuál de las carpetas principales (SINFI, DJ, CIBELES, etc.)
-    reside realmente la carpeta del álbum en el disco local.
+    Devuelve dónde está realmente el archivo de una canción.
+    1) Por la cola de la ruta que da Navidrome (Artista/Álbum/archivo.mp3), que sirve
+       aunque no diga en qué carpeta principal está.
+    2) Si el archivo se movió a otro sitio (p. ej. suelto en BORRAR/), por el tag de álbum.
     """
-    # 1. Si la ruta de Navidrome existe directamente en el sistema de archivos
-    if navidrome_path:
-        p = Path(navidrome_path)
-        if p.exists():
-            return p
+    rel = (song.get("path") or "").replace("\\", "/").strip("/")
+    if not rel:
+        return []
+    parts = rel.split("/")
+    cands = index.get(parts[-1].casefold(), [])
+    if not cands:
+        return []
 
-    # 2. Buscar en las carpetas principales conocidas
-    for main_folder in MAIN_FOLDERS:
-        # Intento A: Ruta estándar con subcarpeta Organizado (ej: SINFI/Organizado/Artista/Album)
-        candidate_a = MUSIC_BASE_ROOT / main_folder / "Organizado" / artist / album
-        if candidate_a.exists():
-            return candidate_a
+    for k in range(min(len(parts), 4), 1, -1):          # cola de 4, 3 y 2 componentes
+        tail = "/" + "/".join(parts[-k:]).casefold()
+        hits = [p for p in cands if p.as_posix().casefold().endswith(tail)]
+        if hits:
+            return hits
 
-        # Intento B: Ruta directa (ej: CIBELES/Artista/Album)
-        candidate_b = MUSIC_BASE_ROOT / main_folder / artist / album
-        if candidate_b.exists():
-            return candidate_b
+    target = _norm(album_name)
+    return [p for p in cands if _norm(read_album_tag(p)) == target]
 
-        # Intento C: Búsqueda flexible por nombre de álbum dentro de la carpeta principal
-        matches = list((MUSIC_BASE_ROOT / main_folder).glob(f"**/{album}"))
-        for m in matches:
-            if m.is_dir():
-                return m
 
-    return None
+def locate_album_files(songs: list[dict], album_name: str, index: dict[str, list[Path]]) -> list[Path]:
+    seen, files = set(), []
+    for song in songs:
+        for p in locate_song(song, album_name, index):
+            if p not in seen:
+                seen.add(p)
+                files.append(p)
+    return files
+
+
+def audio_in_dir(folder: Path) -> set[Path]:
+    try:
+        return {p for p in folder.iterdir() if p.is_file() and p.suffix.lower() in AUDIO_EXT}
+    except OSError:
+        return set()
+
+
+def rel_to_root(path: Path) -> str:
+    try:
+        return str(path.relative_to(MUSIC_BASE_ROOT))
+    except ValueError:
+        return str(path)
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+#  MP3
+# ─────────────────────────────────────────────────────────────────────────────
 
 def mp3_has_embedded_cover(file_path: Path) -> bool:
     """Comprueba si el MP3 ya tiene portada interna APIC."""
@@ -135,7 +233,9 @@ def mp3_has_embedded_cover(file_path: Path) -> bool:
         pass
     return False
 
-def update_mp3_metadata(file_path: Path, image_bytes: bytes | None, mime_type: str, extra_tags: dict):
+
+def update_mp3_metadata(file_path: Path, image_bytes: bytes | None, mime_type: str,
+                        extra_tags: dict, embed: bool):
     try:
         try:
             easy_audio = EasyID3(file_path)
@@ -154,7 +254,7 @@ def update_mp3_metadata(file_path: Path, image_bytes: bytes | None, mime_type: s
         if tags_updated:
             easy_audio.save()
 
-        if image_bytes and not mp3_has_embedded_cover(file_path):
+        if image_bytes and embed:
             audio = MP3(file_path, ID3=ID3)
             if audio.tags is None:
                 audio.add_tags()
@@ -175,6 +275,11 @@ def update_mp3_metadata(file_path: Path, image_bytes: bytes | None, mime_type: s
         print(f"    ⚠️ Error actualizando metadatos en {file_path.name}: {e}")
         return False, False
 
+
+# ─────────────────────────────────────────────────────────────────────────────
+#  FUENTES DE PORTADAS
+# ─────────────────────────────────────────────────────────────────────────────
+
 def get_data_musicbrainz(artist: str, album: str) -> dict | None:
     try:
         query = f'artist:"{artist}" AND release:"{album}"'
@@ -182,11 +287,11 @@ def get_data_musicbrainz(artist: str, album: str) -> dict | None:
         res = requests.get(url, headers=HEADERS, timeout=10)
         res.raise_for_status()
         releases = res.json().get("releases", [])
-        
+
         if releases:
             rel = releases[0]
             release_id = rel["id"]
-            
+
             cover_url = None
             caa_res = requests.get(f"https://coverartarchive.org/release/{release_id}", headers=HEADERS, timeout=10)
             if caa_res.status_code == 200:
@@ -210,6 +315,7 @@ def get_data_musicbrainz(artist: str, album: str) -> dict | None:
         pass
     return None
 
+
 def get_data_itunes(artist: str, album: str) -> dict | None:
     try:
         query = f"{artist} {album}"
@@ -221,7 +327,7 @@ def get_data_itunes(artist: str, album: str) -> dict | None:
             item = results[0]
             raw_url = item.get("artworkUrl100", "")
             cover_url = raw_url.replace("100x100bb.jpg", "3000x3000bb.jpg") if raw_url else None
-            
+
             release_date = item.get("releaseDate", "")
             year = release_date.split("-")[0] if release_date else None
 
@@ -233,6 +339,7 @@ def get_data_itunes(artist: str, album: str) -> dict | None:
     except Exception:
         pass
     return None
+
 
 def get_data_discogs(artist: str, album: str) -> dict | None:
     if not DISCOGS_TOKEN:
@@ -256,6 +363,7 @@ def get_data_discogs(artist: str, album: str) -> dict | None:
         pass
     return None
 
+
 def fetch_metadata_cascade(artist: str, album: str) -> dict:
     data = get_data_musicbrainz(artist, album)
     if data:
@@ -271,6 +379,7 @@ def fetch_metadata_cascade(artist: str, album: str) -> dict:
 
     return {}
 
+
 def fetch_image_data(url: str) -> tuple[bytes | None, str]:
     try:
         res = requests.get(url, headers=HEADERS, timeout=25)
@@ -280,6 +389,11 @@ def fetch_image_data(url: str) -> tuple[bytes | None, str]:
     except Exception:
         return None, "image/jpeg"
 
+
+# ─────────────────────────────────────────────────────────────────────────────
+#  MAIN
+# ─────────────────────────────────────────────────────────────────────────────
+
 def main():
     print(f"📡 Conectando a Navidrome en {NAVIDROME_URL}...")
     albums = get_albums_from_navidrome()
@@ -288,30 +402,65 @@ def main():
         print("❌ No se obtuvieron álbumes de Navidrome.")
         return
 
-    total = len(albums)
-    print(f"🔍 Total de álbumes encontrados en Navidrome: {total}\n")
+    roots = get_search_roots()
+    if not roots:
+        return
 
+    total = len(albums)
+    print(f"🔍 Total de álbumes encontrados en Navidrome: {total}")
+    print(f"📂 Carpetas donde se busca: {', '.join(r.name for r in roots)}")
+    print("🗂️  Indexando archivos de audio (una sola pasada)...")
+    index, n_files = build_index(roots)
+    print(f"   {n_files} archivos indexados\n")
+
+    session = requests.Session()
     downloaded_covers = 0
     updated_files = 0
-    not_found_dirs = 0
+    not_found_albums = 0
+    shared_dirs = 0
+    skipped_complete = 0
 
     for idx, alb in enumerate(albums, start=1):
         artist = alb.get("artist", "Desconocido")
         title = alb.get("title", alb.get("name", "Desconocido"))
-        nav_path = alb.get("path")
-
         label = f"[{idx}/{total}] {artist} – {title}"
 
-        # Resolver dinámicamente la carpeta real (SINFI, CIBELES, DJ, etc.)
-        album_dir = resolve_real_album_dir(artist, title, nav_path)
-
-        if not album_dir:
-            print(f"⚠️ carpeta no encontrada localmente para: {label}")
-            not_found_dirs += 1
+        # 1. Dónde están REALMENTE las canciones de este álbum
+        try:
+            songs = get_album_songs(session, alb.get("id"))
+        except Exception as e:
+            print(f"⚠️ No se pudieron leer las canciones de Navidrome para {label}: {e}")
             continue
 
-        target_cover = album_dir / "cover.jpg"
-        mp3_files = list(album_dir.glob("*.mp3"))
+        files = locate_album_files(songs, title, index)
+        if not files:
+            print(f"⚠️ canciones no localizadas en disco para: {label}")
+            not_found_albums += 1
+            continue
+
+        by_dir: dict[Path, list[Path]] = {}
+        for f in files:
+            by_dir.setdefault(f.parent, []).append(f)
+
+        # 2. Carpetas donde corresponde colocar cover.jpg: solo las que contienen
+        #    únicamente canciones de este álbum (si hay audios de otros álbumes, un
+        #    cover.jpg sería de uno solo y estaría mal para el resto).
+        cover_dirs = []
+        for folder, album_files in by_dir.items():
+            others = audio_in_dir(folder) - set(album_files)
+            if others:
+                shared_dirs += 1
+                print(f"    ↪ {rel_to_root(folder)} contiene {len(others)} audio(s) de otros álbumes: "
+                      f"no se escribe cover.jpg (solo se incrusta en los MP3)")
+            elif not (folder / "cover.jpg").exists():
+                cover_dirs.append(folder)
+
+        mp3_files = [f for f in files if f.suffix.lower() == ".mp3"]
+        need_embed = {f for f in mp3_files if not mp3_has_embedded_cover(f)}
+
+        if SKIP_COMPLETE and not cover_dirs and not need_embed:
+            skipped_complete += 1
+            continue
 
         meta = fetch_metadata_cascade(artist, title)
 
@@ -328,25 +477,31 @@ def main():
             "musicbrainz_albumid": meta.get("musicbrainz_albumid")
         }
 
-        print(f"🔎 Procesando en [{album_dir.parent.name}]: {label} (Fuente: {source})")
+        where = ", ".join(rel_to_root(d) for d in by_dir)
+        print(f"🔎 Procesando: {label} (Fuente: {source})")
+        print(f"    📍 Ubicación real: {where}")
 
+        # Solo se descarga la imagen si hace falta en algún sitio
         img_bytes, mime_type = (None, "image/jpeg")
-        if cover_url:
+        if cover_url and (cover_dirs or need_embed):
             img_bytes, mime_type = fetch_image_data(cover_url)
 
-        # 1. Guardar la carátula únicamente en la carpeta del álbum que le corresponde
-        if cover_url and img_bytes and not target_cover.exists():
-            try:
-                with open(target_cover, "wb") as f:
-                    f.write(img_bytes)
-                print(f"    📁 Guardado {target_cover.name} en: {album_dir}")
-                downloaded_covers += 1
-            except Exception as e:
-                print(f"    ⚠️ Error escribiendo cover.jpg: {e}")
+        # 3. cover.jpg junto a las canciones, donde de verdad están
+        if img_bytes:
+            for folder in cover_dirs:
+                try:
+                    with open(folder / "cover.jpg", "wb") as f:
+                        f.write(img_bytes)
+                    print(f"    📁 Guardado cover.jpg en: {rel_to_root(folder)}")
+                    downloaded_covers += 1
+                except Exception as e:
+                    print(f"    ⚠️ Error escribiendo cover.jpg en {folder}: {e}")
 
-        # 2. Incrustar dentro del MP3 solo si no contiene ya una portada
+        # 4. Tags e imagen incrustada, solo en los MP3 de ESTE álbum
         for mp3_file in mp3_files:
-            cover_added, tags_added = update_mp3_metadata(mp3_file, img_bytes, mime_type, extra_tags)
+            cover_added, tags_added = update_mp3_metadata(
+                mp3_file, img_bytes, mime_type, extra_tags, embed=mp3_file in need_embed
+            )
             if cover_added or tags_added:
                 print(f"    🎵 Actualizado {mp3_file.name} (Tags: {tags_added}, Carátula incrustada: {cover_added})")
                 updated_files += 1
@@ -355,10 +510,13 @@ def main():
 
     print("\n" + "=" * 50)
     print("📊 RESUMEN FINAL:")
-    print(f"  • Portadas externas guardadas en carpeta: {downloaded_covers}")
+    print(f"  • Portadas cover.jpg guardadas:            {downloaded_covers}")
     print(f"  • Archivos MP3 actualizados:               {updated_files}")
-    print(f"  • Carpetas no localizadas localmente:     {not_found_dirs}")
+    print(f"  • Carpetas compartidas (sin cover.jpg):    {shared_dirs}")
+    print(f"  • Álbumes ya completos (omitidos):         {skipped_complete}")
+    print(f"  • Álbumes no localizados en disco:         {not_found_albums}")
     print("=" * 50)
+
 
 if __name__ == "__main__":
     main()
