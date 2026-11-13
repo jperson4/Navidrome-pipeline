@@ -45,7 +45,7 @@ load_dotenv()
 warnings.filterwarnings("ignore")  # librosa/numba throw noisy warnings
 
 EXTENSIONS = {".mp3"}
-DEFAULT_MUSIC_PATH = os.getenv("MUSIC_PATH")
+DEFAULT_MUSIC_PATH = os.getenv("ROOT_PATH")
 
 # Registrar la etiqueta personalizada 'bpm_engine' en EasyID3
 try:

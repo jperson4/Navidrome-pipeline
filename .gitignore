@@ -4,3 +4,4 @@ private
 *.html
 scripts/wantlist_cache.json
 scripts/discogs_covers_cache.json
+revision.csv

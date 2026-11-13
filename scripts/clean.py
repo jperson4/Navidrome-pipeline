@@ -57,7 +57,7 @@ except ImportError:  # el .env es opcional
 #  CONFIGURACIÓN (edítala a gusto)
 # ─────────────────────────────────────────────────────────────────────────────
 
-DEFAULT_FOLDER = os.getenv("MUSIC_PATH", ".")
+DEFAULT_FOLDER = os.getenv("ROOT_PATH", ".")
 DEFAULT_EXCLUDE = ["Duplicados"]          # carpetas que se ignoran por defecto
 
 # Nombres de artista que NO deben separarse aunque lleven "&", "," o "and".

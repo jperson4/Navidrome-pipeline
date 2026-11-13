@@ -46,7 +46,7 @@ load_dotenv()
 
 # Folder that contains all your main subfolders (bandcamp, BORRAR, DJ, SINFI, etc.).
 # Reads MUSIC_BASE_ROOT or MUSIC_PATH, falling back to /home/escriva/music/baldman
-MUSIC_ROOT = os.getenv("MUSIC_BASE_ROOT") or os.getenv("MUSIC_PATH", "/home/escriva/music/baldman")
+MUSIC_ROOT = os.getenv("ROOT_PATH") or os.getenv("MUSIC_PATH", "/home/escriva/music/baldman")
 
 # "Playlist name in Navidrome": "Destination folder"
 #   - A relative folder is taken relative to MUSIC_ROOT ("BORRAR" -> MUSIC_ROOT/BORRAR)
