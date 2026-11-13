@@ -66,7 +66,7 @@ SCRIPTS = {
         "icon": "🖼️", "tag": "Biblioteca",
         "title": "Descargar carátulas",
         "desc": "Busca portadas en cascada (MBZ → IT → DG) y las incrusta en ID3 / cover.jpg",
-        "cmd": [VENV_PYTHON, "-u", f"{SCRIPTS_DIR}/download_covers.py"],
+        "cmd": [VENV_PYTHON, "-u", f"{SCRIPTS_DIR}/covers.py"],
     },
     "wantlist": {
         "icon": "📋", "tag": "Discogs",
