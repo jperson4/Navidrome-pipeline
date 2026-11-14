@@ -56,6 +56,7 @@ PLAYLIST_FOLDERS = {
     "_BORRAR":  "BORRAR",
     "_CIBELES": "CIBELES",
     "_BRAKES":  "BRAKES",
+    "_RENOMBRAR", "RENOMBRAR"
 }
 
 # Carpetas principales conocidas dentro de MUSIC_ROOT
